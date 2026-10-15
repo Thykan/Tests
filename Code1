@@ -1,0 +1,157 @@
+En Google Apps Script (JavaScript) es incluso más cómodo porque el objeto nativo Date permite calcular el último día del mes pasando el día 0 del mes siguiente (new Date(año, mes + 1, 0)), y además puedes usar las funciones directamente como fórmulas personalizadas en Google Sheets (ej. =DIA_SEMANA_CODIGO(A2)).
+Aquí tienes la implementación completa usando el código de 3 caracteres (A00, ALU, AJU, D01, D26, L00, 3MI, LVI, etc.). Incluye tanto la función que devuelve el nombre del día de la semana como otra auxiliar por si necesitas comprobar si una fecha concreta cumple el código (muy útil para triggers diarios en Apps Script).
+Código para Google Apps Script (Código.gs)
+// Equivalencia con Date.getDay() de JavaScript (0 = Domingo, 1 = Lunes, ..., 6 = Sábado)
+const MAPA_DIAS = {
+  "DO": 0,
+  "LU": 1,
+  "MA": 2,
+  "MI": 3,
+  "JU": 4,
+  "VI": 5,
+  "SA": 6
+};
+
+const NOMBRES_DIAS = [
+  "Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"
+];
+
+/**
+ * Devuelve el día de la semana correspondiente al código de 3 caracteres.
+ * Se puede usar en scripts o como fórmula en Google Sheets: =OBTENER_DIA_CODIGO("D26")
+ *
+ * @param {string} codigo Código de 3 caracteres (ej: "A00", "ALU", "D01", "D26", "3MI", "L00").
+ * @param {Date} [fechaRef] Opcional. Fecha de referencia (por defecto hoy).
+ * @return {string} Nombre del día de la semana.
+ * @customfunction
+ */
+function OBTENER_DIA_CODIGO(codigo, fechaRef) {
+  if (!codigo || typeof codigo !== "string" || codigo.length !== 3) {
+    throw new Error("El código debe ser un texto de 3 caracteres (ej. A00, ALU, D26, 3MI).");
+  }
+
+  codigo = codigo.toUpperCase().trim();
+  const fecha = fechaRef ? new Date(fechaRef) : new Date();
+  const anio = fecha.getFullYear();
+  const mes = fecha.getMonth(); // 0 (Enero) a 11 (Diciembre)
+
+  const prefijo = codigo.charAt(0);
+  const objetivo = codigo.substring(1, 3);
+
+  // Último día numérico del mes actual (truco de JS: día 0 del mes siguiente)
+  const ultimoDiaMes = new Date(anio, mes + 1, 0).getDate();
+
+  // 1. Todos los días (A00) -> Devuelve el día de la semana de la fecha de referencia
+  if (codigo === "A00") {
+    return NOMBRES_DIAS[fecha.getDay()];
+  }
+
+  // 2. Primer día de la semana (W01) -> Lunes
+  if (codigo === "W01") {
+    return NOMBRES_DIAS[1];
+  }
+
+  // 3. Cualquier código terminado en día de la semana (ALU, AJU, 3MI, LVI...)
+  if (objetivo in MAPA_DIAS) {
+    return NOMBRES_DIAS[MAPA_DIAS[objetivo]];
+  }
+
+  // 4. Día fijo del mes (D01 a D31)
+  if (prefijo === "D" && !isNaN(objetivo)) {
+    const diaNum = Math.min(parseInt(objetivo, 10), ultimoDiaMes);
+    const fechaCalculada = new Date(anio, mes, diaNum);
+    return NOMBRES_DIAS[fechaCalculada.getDay()];
+  }
+
+  // 5. Último día del mes (L00)
+  if (codigo === "L00") {
+    const fechaCalculada = new Date(anio, mes, ultimoDiaMes);
+    return NOMBRES_DIAS[fechaCalculada.getDay()];
+  }
+
+  throw new Error("Código no válido: " + codigo);
+}
+
+
+/**
+ * Evalúa si una fecha concreta (o hoy) cumple la regla del código.
+ * Ideal para ejecutar un trigger diario y saber si toca lanzar una tarea.
+ *
+ * @param {string} codigo Código de 3 caracteres.
+ * @param {Date} [fechaRef] Opcional. Fecha a evaluar (por defecto hoy).
+ * @return {boolean} True si la fecha cumple la condición del código.
+ * @customfunction
+ */
+function CUMPLE_CODIGO_FECHA(codigo, fechaRef) {
+  if (!codigo || typeof codigo !== "string" || codigo.length !== 3) return false;
+
+  codigo = codigo.toUpperCase().trim();
+  const fecha = fechaRef ? new Date(fechaRef) : new Date();
+  const anio = fecha.getFullYear();
+  const mes = fecha.getMonth();
+  const diaMes = fecha.getDate();       // 1 a 31
+  const diaSemana = fecha.getDay();     // 0 (Dom) a 6 (Sáb)
+  const ultimoDiaMes = new Date(anio, mes + 1, 0).getDate();
+
+  const prefijo = codigo.charAt(0);
+  const objetivo = codigo.substring(1, 3);
+
+  // 1. Todos los días
+  if (codigo === "A00") return true;
+
+  // 2. Primer día de la semana (W01 = Lunes)
+  if (codigo === "W01") return diaSemana === 1;
+
+  // 3. Último día del mes (L00)
+  if (codigo === "L00") return diaMes === ultimoDiaMes;
+
+  // 4. Día numérico del mes (D01, D26...)
+  if (prefijo === "D" && !isNaN(objetivo)) {
+    const diaObjetivo = Math.min(parseInt(objetivo, 10), ultimoDiaMes);
+    return diaMes === diaObjetivo;
+  }
+
+  // 5. Reglas basadas en día de la semana (ALU, AJU, 3MI, LVI...)
+  if (objetivo in MAPA_DIAS) {
+    // Si hoy no es ese día de la semana, descartamos directamente
+    if (diaSemana !== MAPA_DIAS[objetivo]) return false;
+
+    // A = Todos los [día] (ej. ALU, AJU)
+    if (prefijo === "A") return true;
+
+    // L = Último [día] del mes (ej. LVI = último viernes)
+    if (prefijo === "L") return (diaMes + 7) > ultimoDiaMes;
+
+    // 1 a 5 = N-ésimo [día] del mes (ej. 3MI = tercer miércoles)
+    if (!isNaN(prefijo)) {
+      const ordenMes = Math.floor((diaMes - 1) / 7) + 1;
+      return ordenMes === parseInt(prefijo, 10);
+    }
+  }
+
+  return false;
+}
+
+Resumen rápido de tu diccionario de códigos
+Con este bloque en Apps Script tienes cubiertos todos los casos que mencionaste y cualquier combinación similar sin tocar el código:
+| Caso | Código | Qué hace OBTENER_DIA_CODIGO | Qué hace CUMPLE_CODIGO_FECHA |
+|---|---|---|---|
+| Todos los días | A00 | Día de la semana de hoy | Siempre true |
+| Primer día de la semana | W01 (o ALU) | "Lunes" | true si es lunes |
+| Todos los lunes / jueves | ALU / AJU | "Lunes" / "Jueves" | true cada lunes / jueves |
+| Primer día del mes | D01 | Día en que cae el 1 del mes | true el día 1 de cada mes |
+| Día 26 del mes | D26 | Día en que cae el 26 del mes | true el día 26 de cada mes |
+| Último día del mes | L00 | Día en que cae el fin de mes | true el 28/29/30/31 según el mes |
+| Tercer miércoles del mes | 3MI | "Miércoles" | true solo el 3er miércoles del mes |
+| Último viernes del mes | LVI | "Viernes" | true solo el último viernes del mes |
+Cómo probarlo dentro del editor de Apps Script
+Si quieres verificar el comportamiento en el registro (Ctrl + Enter o Registro de ejecución), puedes añadir esta pequeña función de prueba:
+function testCodigos() {
+  const fechaPrueba = new Date(2026, 9, 21); // 21 de Octubre de 2026 (3er Miércoles)
+  
+  Logger.log("Día para D26: " + OBTENER_DIA_CODIGO("D26", fechaPrueba)); // Lunes
+  Logger.log("Día para L00: " + OBTENER_DIA_CODIGO("L00", fechaPrueba)); // Sábado
+  Logger.log("¿El 21/10/2026 cumple 3MI?: " + CUMPLE_CODIGO_FECHA("3MI", fechaPrueba)); // true
+  Logger.log("¿El 21/10/2026 cumple 2MI?: " + CUMPLE_CODIGO_FECHA("2MI", fechaPrueba)); // false
+}
+
