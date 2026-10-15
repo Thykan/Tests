@@ -258,3 +258,167 @@ Detalles importantes de cómo funciona:
    * Crea bloques separados para cada día (Lunes, Martes, Miércoles, Jueves, Viernes) con fondo azul claro (#D9E1F2).
    * Debajo de cada día coloca de forma ordenada todas las filas completas de datos que cumplían la condición.
  * Automatización semanal: Puedes configurar un activador basado en tiempo (Triggers) en Apps Script para que esta función se ejecute sola todos los viernes o domingos por la tarde, dejando lista la hoja execution con la planificación de la semana entrante.
+
+
+¡Sí, totalmente! Recuperar esa opción de añadir un sufijo de desplazamiento (+ o -) es perfecto para casos tan específicos como "el segundo viernes del mes menos 2 días" (lo cual te situaría en un miércoles).
+Al final, aquello que en su día descartaste por miedo a usarlo a lo largo de todo el mes como un "parche" para los festivos, cobra todo el sentido del mundo cuando se usa como una regla de cálculo precisa (por ejemplo: "hacer X tarea 2 días antes de la presentación que siempre cae el segundo viernes").
+Cómo funcionaría con el código de 3 caracteres + el modificador
+Podemos ampliar el sistema para que admita códigos de 5 caracteres cuando necesites un desplazamiento, manteniendo tus códigos limpios de 3 caracteres para el resto:
+ * 2VI → Segundo viernes del mes.
+ * 2VI-2 → Segundo viernes del mes menos 2 días (retrocede 2 días).
+ * 1LU+1 → Primer lunes del mes más 1 día (el martes siguiente al primer lunes).
+ * LVI-1 → Último viernes del mes menos 1 día (el jueves anterior al último viernes).
+Actualización del script en Google Apps Script
+Aquí tienes cómo modificar la función auxiliar calcularFechaExactaDelCodigo_ para que detecte si el código lleva un + o un - al final y mueva la fecha esos días exactos:
+function calcularFechaExactaDelCodigo_(codigoRaw, referenciaSemana) {
+  // 1. Limpiar y buscar si trae modificador de días (+X o -X al final)
+  const codigoLimpio = codigoRaw.toUpperCase().trim();
+  const matchModificador = codigoLimpio.match(/^([A-Z0-9]{3})([+-]\d+)$/);
+  
+  let codigoBase = codigoLimpio;
+  let diasOffset = 0;
+
+  if (matchModificador) {
+    codigoBase = matchModificador[1];
+    diasOffset = parseInt(matchModificador[2], 10); // Ej: -2 o +1
+  }
+
+  const anio = referenciaSemana.getFullYear();
+  const mes = referenciaSemana.getMonth();
+  const ultimoDiaMes = new Date(anio, mes + 1, 0).getDate();
+
+  const prefijo = codigoBase.charAt(0);
+  const objetivo = codigoBase.substring(1, 3);
+  let fechaEncontrada = null;
+
+  // --- CÁLCULO DE LA FECHA BASE ---
+  if (codigoBase === "A00") {
+    fechaEncontrada = new Date(referenciaSemana);
+  }
+  else if (codigoBase === "W01") {
+    fechaEncontrada = new Date(referenciaSemana); // Lunes
+  }
+  else if (codigoBase === "WUL") {
+    let viernes = new Date(referenciaSemana);
+    viernes.setDate(viernes.getDate() + 4);
+    fechaEncontrada = viernes;
+  }
+  else if (prefijo === "D" && !isNaN(objetivo)) {
+    const num = parseInt(objetivo, 10);
+    if (num >= 1 && num <= 31) {
+      const diaNum = Math.min(num, ultimoDiaMes);
+      let d = new Date(anio, mes, diaNum);
+      let dow = d.getDay();
+      if (dow === 6) d.setDate(d.getDate() + (diaNum + 2 <= ultimoDiaMes ? 2 : -1));
+      else if (dow === 0) d.setDate(d.getDate() + (diaNum + 1 <= ultimoDiaMes ? 1 : -2));
+      fechaEncontrada = d;
+    }
+  }
+  else if (codigoBase === "L00") {
+    let d = new Date(anio, mes, ultimoDiaMes);
+    let dow = d.getDay();
+    if (dow === 6) d.setDate(d.getDate() - 1);
+    if (dow === 0) d.setDate(d.getDate() - 2);
+    fechaEncontrada = d;
+  }
+  else if (objetivo in MAPA_DIAS_LAB) {
+    const diaMeta = MAPA_DIAS_LAB[objetivo];
+    let contador = 0;
+
+    if (prefijo === "A" || (prefijo >= "1" && prefijo <= "5")) {
+      const n = (prefijo === "A") ? 1 : parseInt(prefijo, 10);
+      for (let dia = 1; dia <= ultimoDiaMes; dia++) {
+        let temp = new Date(anio, mes, dia);
+        // Comprobamos que sea laborable (Lun-Vie) para que coincida con tu lógica
+        if (temp.getDay() === diaMeta) {
+          contador++;
+          if (contador === n) {
+            fechaEncontrada = temp;
+            break;
+          }
+        }
+      }
+    } else if (prefijo === "L") {
+      for (let dia = ultimoDiaMes; dia >= 1; dia--) {
+        let temp = new Date(anio, mes, dia);
+        if (temp.getDay() === diaMeta) {
+          fechaEncontrada = temp;
+          break;
+        }
+      }
+    }
+  }
+
+  // Si no se pudo calcular la fecha base, devolvemos null
+  if (!fechaEncontrada) return null;
+
+  // --- APLICAR EL DESPLAZAMIENTO (+X o -X) SI LO TIENE ---
+  if (diasOffset !== 0) {
+    fechaEncontrada.setDate(fechaEncontrada.getDate() + diasOffset);
+  }
+
+  return fechaEncontrada;
+}
+
+Ventaja de este enfoque híbrido:
+ * Tus códigos habituales siguen siendo limpios y fijos de 3 caracteres (3MI, D26, L00).
+ * Para esas excepciones puntuales de planificación donde necesitas calcular un día relativo a una ocurrencia del mes, puedes escribir tranquilamente códigos de 5 caracteres como 2VI-2 o 1LU+3 en la columna F, y el script los calculará y ubicará en el día de la semana correcto de la hoja execution.
+
+Aquí tienes la Guía Definitiva de Códigos totalmente actualizada. Está diseñada para ser extremadamente clara, visual y fácil de usar por cualquier persona que vaya a rellenar la columna de frecuencias (tanto si usa los códigos estándar de 3 caracteres como si necesita aplicar desplazamientos avanzados).
+📖 GUÍA OFICIAL: Cómo definir los códigos de frecuencia (delivery_frequency)
+Esta guía explica cómo estructurar el código alfanumérico en la hoja de tareas para que el sistema calcule automáticamente el día exacto de la semana en el que debe ejecutarse.
+1. Estructura General del Código
+ * Códigos estándar (3 caracteres): [Tipo / Ocurrencia] + [Día objetivo / Fecha]
+ * Códigos con desplazamiento (5 caracteres - Opcional): [Código base de 3 caracteres] + [Desplazamiento en días (+X o -X)]
+> Nota importante: El sistema trabaja exclusivamente con días laborables (Lunes a Viernes). Si una fecha fija calculada cae en fin de semana (sábado o domingo), el sistema la reubica automáticamente al lunes o viernes correspondiente.
+> 
+2. Catálogo de Códigos Disponibles
+A. Códigos Globales y Semanales
+| Código | Qué significa | Ejemplo de resultado |
+|---|---|---|
+| A00 | Todos los días laborables | Aplica a diario (Lun-Vie) |
+| W01 | Primer día de la semana | Siempre cae en Lunes |
+| WUL | Último día de la semana | Siempre cae en Viernes |
+B. Días de la Semana Recurrentes (Todos los...)
+Utiliza la letra A seguida de las dos letras del día laborable:
+ * ALU → Todos los Lunes
+ * AMA → Todos los Martes
+ * AMI → Todos los Miércoles
+ * AJU → Todos los Jueves
+ * AVI → Todos los Viernes
+C. Ocurrencias Ordinales dentro del Mes (Ej. El 3.er miércoles)
+Combina un número del 1 al 5 con las dos letras del día:
+ * 1LU → Primer lunes del mes
+ * 3MI → Tercer miércoles del mes
+ * 5VI → Quinto viernes del mes (si el mes no tiene 5 viernes, el sistema lo omite)
+D. Última Ocurrencia del Mes
+Utiliza la letra L (Last) seguida del día:
+ * LLU → Último lunes del mes
+ * LMI → Último miércoles del mes
+ * LVI → Último viernes del mes
+E. Días Fijos del Mes
+Utiliza la letra D seguida de un número de dos dígitos (01 a 31):
+ * D01 → Día 1 del mes (si cae en fin de semana, pasa al lunes)
+ * D26 → Día 26 del mes (si cae en fin de semana, pasa al lunes)
+ * D31 → Día 31 del mes (si el mes no tiene 31 días o es fin de semana, se ajusta al último laborable)
+F. Cierre de Mes
+ * L00 → Último día laborable del mes (si cae en fin de semana, retrocede al viernes).
+3. Modificadores Avanzados (Desplazamientos + / -)
+Si necesitas programar una tarea para un número exacto de días antes o después de una fecha clave del mes, puedes añadir un modificador al final del código base:
+ * Estructura: [Código Base] + [Signo + o -] + [Número de días]
+| Código | Explicación detallada |
+|---|---|
+| 2VI-2 | El segundo viernes del mes menos 2 días (es decir, el miércoles de esa misma semana). |
+| 1LU+1 | El primer lunes del mes más 1 día (es decir, el martes de esa misma semana). |
+| LVI-1 | El último viernes del mes menos 1 día (es decir, el jueves anterior al cierre de mes). |
+4. Resumen Rápido (Tabla Resumen)
+| Propósito | Formato | Ejemplo | Resultado Práctico |
+|---|---|---|---|
+| Diario | A00 | A00 | Todos los días (Lun-Vie) |
+| Inicio / Fin semana | W01 o WUL | W01 | Lunes |
+| Día semanal fijo | A + [Día] | AJU | Todos los jueves |
+| N-ésimo del mes | [1-5] + [Día] | 3MI | 3.er miércoles del mes |
+| El último del mes | L + [Día] | LVI | Último viernes del mes |
+| Día numérico fijo | D + [Número] | D26 | Día 26 del mes |
+| Cierre de mes | L00 | L00 | Último día laborable |
+| Modificado (Offset) | [Código] + / - [Días] | 2VI-2 | 2 días antes del 2º viernes |
