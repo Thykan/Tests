@@ -1,113 +1,260 @@
-Aquí tienes el código limpio, estrictamente de 3 caracteres (sin signos + ni -) y trabajando únicamente con días laborables (Lunes a Viernes):
- * Sábados y domingos quedan excluidos del mapa de días.
- * Si un día fijo del mes (D01, D26...) cae en sábado o domingo, pasa automáticamente al Lunes (salvo si ese ajuste se saliera del mes actual en días como D30 o D31, en cuyo caso se queda en el Viernes de ese mismo mes).
- * Si el último día del mes (L00) cae en sábado o domingo, retrocede automáticamente al Viernes.
-Código para Google Apps Script (Código.gs)
-// Solo días laborables (Lunes = 1 a Viernes = 5)
+Aquí tienes el código completo para tu Google Apps Script. Esta función recorre tu hoja de tareas (leyendo el código de 3 caracteres de la columna F), calcula exactamente a qué día de la semana próxima aplica cada tarea usando la lógica que hemos visto, y genera automáticamente la estructura en la hoja execution con sus separadores de semana (en azul marino) y de cada día (en azul más claro), ordenando las tareas de Lunes a Viernes.
+Cómo calcular el número de semana ISO en Apps Script
+Para obtener correctamente el número de la semana ISO actual o de la semana próxima, JavaScript se apoya en un pequeño cálculo matemático que también se incluye abajo.
+Código de Apps Script (GenerarPlanificacion.gs)
 const MAPA_DIAS_LAB = {
-  "LU": 1,
-  "MA": 2,
-  "MI": 3,
-  "JU": 4,
-  "VI": 5
+  "LU": 1, "MA": 2, "MI": 3, "JU": 4, "VI": 5
 };
 
-const NOMBRES_DIAS = [
-  "Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"
-];
+const NOMBRES_DIAS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes"];
 
 /**
- * Devuelve el día de la semana laborable (Lunes a Viernes) según el código de 3 caracteres.
- * Soporta celdas individuales o rangos enteros: =OBTENER_DIA_CODIGO(A2:A50; $Z$1)
- *
- * @param {string|Array} codigo Código exacto de 3 caracteres (ej: "W01", "WUL", "D01", "D26", "L00", "3MI").
- * @param {Date} [fechaRef] Opcional. Fecha de referencia (por defecto hoy).
- * @return {string} Nombre del día laborable de la semana.
- * @customfunction
+ * Función principal para planificar la semana próxima desde la hoja de tareas a 'execution'
  */
-function OBTENER_DIA_CODIGO(codigo, fechaRef) {
-  const fechaBase = fechaRef ? new Date(fechaRef) : new Date();
-
-  // Soporte para aplicar a toda una columna de golpe (ARRAYFORMULA)
-  if (Array.isArray(codigo)) {
-    return codigo.map(fila => fila.map(celda => 
-      celda ? evaluarCodigoLaborable_(celda, fechaBase) : ""
-    ));
+function generarPlanificacionSemanal() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // 1. Obtener hojas origen y destino
+  const hojaTareas = ss.getSheetByName("tareas"); // Cambia el nombre si tu hoja se llama diferente
+  const hojaExecution = ss.getSheetByName("execution");
+  
+  if (!hojaTareas || !hojaExecution) {
+    throw new Error("Asegúrate de que existen las hojas 'tareas' y 'execution'.");
   }
 
-  return evaluarCodigoLaborable_(codigo, fechaBase);
+  // 2. Calcular la fecha de inicio de la SEMANA PRÓXIMA (el próximo Lunes)
+  const hoy = new Date();
+  const proximoLunes = obtenerProximoLunes_(hoy);
+  
+  // Calcular el número de semana ISO de ese próximo lunes
+  const numeroSemanaISO = obtenerSemanaISO_(proximoLunes);
+  const anioISO = proximoLunes.getFullYear();
+
+  // 3. Leer los datos de la hoja de tareas (asumiendo que empieza en la fila 2 para saltar cabeceras)
+  const ultimaFila = hojaTareas.getLastRow();
+  if (ultimaFila < 2) return; // No hay tareas
+  
+  // Supongamos que los datos van de la columna A a la F (o más). Columna F es el índice 5 (base 0).
+  const datosTareas = hojaTareas.getRange(2, 1, ultimaFila - 1, hojaTareas.getLastColumn()).getValues();
+
+  // Estructura para agrupar las tareas de la semana próxima por día de la semana (1 = Lunes, ..., 5 = Viernes)
+  const diasSemana = {
+    1: [], // Lunes
+    2: [], // Martes
+    3: [], // Miércoles
+    4: [], // Jueves
+    5: []  // Viernes
+  };
+
+  // 4. Evaluar cada tarea y ver si aplica en alguno de los 5 días laborables de la semana próxima
+  datosTareas.forEach(fila => {
+    const codigo = fila[5]; // Columna F (A=0, B=1, C=2, D=3, E=4, F=5)
+    
+    if (codigo && typeof codigo === "string" && codigo.trim().length === 3) {
+      const fechaAsignada = calcularFechaExactaDelCodigo_(codigo.toUpperCase().trim(), proximoLunes);
+      
+      if (fechaAsignada) {
+        // Comprobar si la fecha cae dentro de los 5 días de la semana próxima (Lunes a Viernes)
+        const diaSem = fechaAsignada.getDay(); // 1 a 5
+        const diffTiempo = fechaAsignada.getTime() - proximoLunes.getTime();
+        const diffDias = Math.round(diffTiempo / (1000 * 3600 * 24));
+        
+        if (diffDias >= 0 && diffDias < 5 && diaSem >= 1 && diaSem <= 5) {
+          diasSemana[diaSem].push(fila);
+        }
+      }
+    }
+  });
+
+  // 5. Escribir los resultados en la hoja 'execution'
+  // Limpiamos el contenido anterior de la hoja execution (opcional, por si quieres que se sobrescriba cada semana)
+  hojaExecution.clearFormats();
+  hojaExecution.clearContent();
+
+  const filasFinales = [];
+
+  // Fila 1: Cabecera principal de la Semana (CW + Número de semana)
+  filasFinales.push([`CW ${numeroSemanaISO} (${anioISO})`, "", "", "", "", ""]);
+  const indiceFilaCW = filasFinales.length;
+
+  // Rellenar por cada día de Lunes a Viernes
+  for (let i = 1; i <= 5; i++) {
+    // Fila del día (ej. Lunes, Martes...)
+    filasFinales.push([NOMBRES_DIAS[i - 1], "", "", "", "", ""]);
+    const indiceFilaDia = filasFinales.length;
+
+    if (diasSemana[i].length > 0) {
+      // Añadir todas las tareas que aplican a este día
+      diasSemana[i].forEach(tarea => {
+        filasFinales.push(tarea);
+      });
+    } else {
+      // Opcional: si no hay tareas, se puede dejar vacío o añadir una fila informativa
+      // filasFinales.push(["Sin tareas para este día", "", "", "", "", ""]);
+    }
+  }
+
+  // Volcar todo el array golpe en la hoja execution
+  if (filasFinales.length > 0) {
+    const rangoDestino = hojaExecution.getRange(1, 1, filasFinales.length, filasFinales[0].length);
+    rangoDestino.setValues(filasFinales);
+
+    // 6. Aplicar formato y colores institucionales / estéticos
+    aplicarFormatosExecution_(hojaExecution, filasFinales, indiceFilaCW);
+  }
 }
 
-function evaluarCodigoLaborable_(codigoRaw, fecha) {
-  if (!codigoRaw || typeof codigoRaw !== "string") return "";
+/**
+ * Aplica los colores de fondo azul marino (CW) y azul claro (Días)
+ */
+function aplicarFormatosExecution_(hoja, filas, indiceFilaCW) {
+  const numColumnas = 6; // Ajusta si tienes más columnas en tu tabla de tareas
 
-  const codigo = codigoRaw.toUpperCase().trim();
-  if (codigo.length !== 3) return "Código inválido";
+  // 1. Formato Fila CW (Azul Marino, Letra blanca, Negrita)
+  const rangoCW = hoja.getRange(indiceFilaCW, 1, 1, numColumnas);
+  rangoCW.merge(); // Unir celdas de la fila CW para que quede tipo banner
+  rangoCW.setBackground("#1B365D"); // Azul marino oscuro
+  rangoCW.setFontColor("#FFFFFF");  // Blanco
+  rangoCW.setFontWeight("bold");
+  rangoCW.setHorizontalAlignment("center");
 
-  const anio = fecha.getFullYear();
-  const mes = fecha.getMonth();
+  // 2. Recorrer las filas para buscar las filas de los días y darles estilo azul claro
+  for (let r = 1; r <= filas.length; r++) {
+    const valorCelda = hoja.getRange(r, 1).getValue();
+    
+    if (NOMBRES_DIAS.includes(valorCelda)) {
+      const rangoDia = hoja.getRange(r, 1, 1, numColumnas);
+      rangoDia.setBackground("#D9E1F2"); // Azul pastel / claro corporativo
+      rangoDia.setFontColor("#000000");  // Negro
+      rangoDia.setFontWeight("bold");
+    }
+  }
+}
+
+/**
+ * Funciones auxiliares de cálculo de fechas y códigos
+ */
+function obtenerProximoLunes_(fechaBase) {
+  const d = new Date(fechaBase);
+  const dia = d.getDay();
+  const diff = d.getDate() - dia + (dia === 0 ? -6 : 1); // Ajustar al lunes de esta semana
+  const lunesActual = new Date(d.setDate(diff));
+  
+  // Sumar 7 días para ir al lunes de la semana próxima
+  const proximoLunes = new Date(lunesActual);
+  proximoLunes.setDate(proximoLunes.getDate() + 7);
+  proximoLunes.setHours(0, 0, 0, 0);
+  return proximoLunes;
+}
+
+function obtenerSemanaISO_(d) {
+  const target = new Date(d.valueOf());
+  const dayNr = (d.getDay() + 6) % 7;
+  target.setDate(target.getDate() - dayNr + 3);
+  const firstThursday = target.valueOf();
+  target.setMonth(0, 1);
+  if (target.getDay() !== 4) {
+    target.setMonth(0, 1 + ((4 - target.getDay()) + 7) % 7);
+  }
+  return Math.ceil((firstThursday - target) / (7 * 86400000) + 1);
+}
+
+function calcularFechaExactaDelCodigo_(codigo, referenciaSemana) {
+  const anio = referenciaSemana.getFullYear();
+  const mes = referenciaSemana.getMonth();
   const ultimoDiaMes = new Date(anio, mes + 1, 0).getDate();
 
   const prefijo = codigo.charAt(0);
   const objetivo = codigo.substring(1, 3);
 
-  // 1. Todos los días laborables (A00)
-  // Si se consulta en sábado o domingo, devuelve el Lunes
+  // A00 (Todos los días laborables) -> Aplica a todos los días de la semana (se evaluará por cada día)
   if (codigo === "A00") {
-    let d = fecha.getDay();
-    if (d === 0 || d === 6) d = 1;
-    return NOMBRES_DIAS[d];
+    // Para A00 devolvemos el lunes de esa semana como referencia base
+    return new Date(referenciaSemana); 
   }
 
-  // 2. Primer y último día de la semana (W01 = Lunes, WUL = Viernes)
-  if (codigo === "W01") return NOMBRES_DIAS[1]; // Lunes
-  if (codigo === "WUL") return NOMBRES_DIAS[5]; // Viernes
+  // W01 (Lunes) o WUL (Viernes)
+  if (codigo === "W01") {
+    return new Date(referenciaSemana); // Lunes
+  }
+  if (codigo === "WUL") {
+    let viernes = new Date(referenciaSemana);
+    viernes.setDate(viernes.getDate() + 4);
+    return viernes;
+  }
 
-  // 3. Días de la semana fijos o N-ésimos del mes (ALU, AJU, 3MI, LVI...)
-  if (objetivo in MAPA_DIAS_LAB) {
-    if (prefijo === "A" || prefijo === "L" || (prefijo >= "1" && prefijo <= "5")) {
-      return NOMBRES_DIAS[MAPA_DIAS_LAB[objetivo]];
+  // Días de la semana fijos dentro de la semana (ALU, AJU, etc.)
+  if (objetivo in MAPA_DIAS_LAB && (prefijo === "A" || prefijo === "L" || (prefijo >= "1" && prefijo <= "5"))) {
+    let d = new Date(referenciaSemana);
+    let diaTarget = MAPA_DIAS_LAB[objetivo];
+    // Buscar qué día de esa semana coincide con el objetivo
+    for (let i = 0; i < 5; i++) {
+      if (d.getDay() === diaTarget) return d;
+      d.setDate(d.getDate() + 1);
     }
-    return "Código inválido";
   }
 
-  // 4. Día fijo del mes ajustado a laborable (D01 a D31)
+  // Día fijo del mes ajustado a laborable (D01 a D31)
   if (prefijo === "D" && !isNaN(objetivo)) {
     const num = parseInt(objetivo, 10);
-    if (num < 1 || num > 31) return "Código inválido";
+    if (num < 1 || num > 31) return null;
 
     const diaNum = Math.min(num, ultimoDiaMes);
-    let d = new Date(anio, mes, diaNum).getDay();
+    let d = new Date(anio, mes, diaNum);
+    let dow = d.getDay();
 
-    // Si cae en Sábado (6) o Domingo (0), avanza al Lunes (1)
-    // Salvo que al avanzar nos salgamos del mes, en cuyo caso retrocede al Viernes (5)
-    if (d === 6) {
-      d = (diaNum + 2 <= ultimoDiaMes) ? 1 : 5;
-    } else if (d === 0) {
-      d = (diaNum + 1 <= ultimoDiaMes) ? 1 : 5;
-    }
-    return NOMBRES_DIAS[d];
+    if (dow === 6) d.setDate(d.getDate() + (diaNum + 2 <= ultimoDiaMes ? 2 : -1));
+    else if (dow === 0) d.setDate(d.getDate() + (diaNum + 1 <= ultimoDiaMes ? 1 : -2));
+    return d;
   }
 
-  // 5. Último día laborable del mes (L00)
+  // Último día laborable del mes (L00)
   if (codigo === "L00") {
-    let d = new Date(anio, mes, ultimoDiaMes).getDay();
-    if (d === 6 || d === 0) d = 5; // Si fin de mes es Sábado o Domingo -> Viernes
-    return NOMBRES_DIAS[d];
+    let d = new Date(anio, mes, ultimoDiaMes);
+    let dow = d.getDay();
+    if (dow === 6) d.setDate(d.getDate() - 1);
+    if (dow === 0) d.setDate(d.getDate() - 2);
+    return d;
   }
 
-  return "Código inválido";
+  // N-ésimo día del mes (ej. 3MI) o último de su tipo (LMI)
+  if (objetivo in MAPA_DIAS_LAB) {
+    const diaMeta = MAPA_DIAS_LAB[objetivo];
+    let contador = 0;
+    let fechaEncontrada = null;
+
+    if (prefijo >= "1" && prefijo <= "5") {
+      const n = parseInt(prefijo, 10);
+      for (let dia = 1; dia <= ultimoDiaMes; dia++) {
+        let temp = new Date(anio, mes, dia);
+        if (temp.getDay() === diaMeta) {
+          contador++;
+          if (contador === n) {
+            fechaEncontrada = temp;
+            break;
+          }
+        }
+      }
+    } else if (prefijo === "L") {
+      for (let dia = ultimoDiaMes; dia >= 1; dia--) {
+        let temp = new Date(anio, mes, dia);
+        if (temp.getDay() === diaMeta) {
+          fechaEncontrada = temp;
+          break;
+        }
+      }
+    }
+    return fechaEncontrada;
+  }
+
+  return null;
 }
 
-Tabla definitiva de códigos (3 caracteres exactos, 100% laborables)
-| Código | Qué representa | Resultado (siempre Lun-Vie) |
-|---|---|---|
-| A00 | Todos los días | El día laborable actual |
-| W01 | Primer día de la semana | Lunes |
-| WUL | Último día de la semana | Viernes |
-| ALU, AMA, AMI, AJU, AVI | Todos los lunes, martes, miércoles, jueves, viernes | Lunes ... Viernes |
-| 1LU a 5VI (ej. 3MI) | 1º, 2º, 3º, 4º o 5º [día] del mes | El día indicado (Miércoles) |
-| LLU a LVI (ej. LVI) | Último [día] del mes | El día indicado (Viernes) |
-| D01 | Primer día del mes | El día que caiga el 1 (si es finde, Lunes) |
-| D02 a D31 (ej. D26) | Día X del mes | El día que caiga (si es finde, salta al Lunes) |
-| L00 | Último día del mes | El día que caiga fin de mes (si es finde, Viernes) |
+Detalles importantes de cómo funciona:
+ * Lectura automática: Lee la hoja llamada tareas buscando en la columna F (la 6ª columna, índice 5) el código alfanumérico de 3 caracteres.
+ * Filtro de la semana próxima: Calcula automáticamente cuál es el lunes de la semana que entra y proyecta las tareas que caen estrictamente entre ese Lunes y ese Viernes. Las tareas que no pertenezcan a esa semana (como un D26 si estamos a día 2) se omiten automáticamente.
+ * Estructura en la hoja execution:
+   * Inserta una primera fila cruzada con el texto CW [número de semana] con fondo azul marino oscuro (#1B365D) y texto en blanco.
+   * Crea bloques separados para cada día (Lunes, Martes, Miércoles, Jueves, Viernes) con fondo azul claro (#D9E1F2).
+   * Debajo de cada día coloca de forma ordenada todas las filas completas de datos que cumplían la condición.
+ * Automatización semanal: Puedes configurar un activador basado en tiempo (Triggers) en Apps Script para que esta función se ejecute sola todos los viernes o domingos por la tarde, dejando lista la hoja execution con la planificación de la semana entrante.
