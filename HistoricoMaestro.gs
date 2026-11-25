@@ -3,19 +3,88 @@
  * HISTORICO MAESTRO PARA LOOKER STUDIO  -  Apps Script (V8)
  * ============================================================================
  *
- * Que hace
- *   Lee los ficheros de periodo de una carpeta de Drive (una hoja por periodo),
- *   y archiva las pestanas de datos que le indiques en un fichero maestro con
- *   ID fijo, una pestana destino por cada entidad (nunca una pestana por periodo).
+ * QUE HACE ESTE SCRIPT
+ *   Coge los ficheros de periodo que ya se guardan en una carpeta de Drive (una
+ *   hoja de Google por semana o por mes), les lee las pestanas de datos y va
+ *   copiando las filas a un unico fichero "maestro" con ID fijo. Ese maestro es
+ *   el que lee Looker Studio, y al tener siempre el mismo ID nunca se rompe la
+ *   conexion. Los periodos viejos se van borrando para que el fichero no crezca.
  *
- * Modelo del maestro (por cada entidad):
+ *   Nunca se crea una pestana por periodo. Se crea UNA PESTANA POR ENTIDAD
+ *   (una cosa que se mide), y todas las filas de todos los periodos se apilan
+ *   ahi dentro. La columna "periodo" dice de que semana o mes viene cada fila.
+ *
+ * COMO QUEDA EL MAESTRO (por cada entidad)
  *   fila 1:  periodo | anio | semana | fecha_reporte | <columnas del origen> | fecha_carga
  *   fila 2+: una fila por registro, con el periodo del fichero del que viene.
  *
- * Garantias
- *   - Idempotente: reejecutar no duplica. Si el periodo ya existe, se borra y se
- *     reescribe (upsert).
- *   - Cabeceras mapeadas POR NOMBRE, nunca por posicion.
+ * ----------------------------------------------------------------------------
+ * COMO LEER ESTE FICHERO SI NO PROGRAMAS JAVASCRIPT
+ * ----------------------------------------------------------------------------
+ *
+ *   function nombre(...) { ... }
+ *       Es una "funcion": un bloque de instrucciones con nombre. Cuando tu
+ *       pulsas Ejecutar en el editor de Apps Script, se ejecuta UNA funcion
+ *       concreta: la que tengas seleccionada en el desplegable de arriba.
+ *
+ *   var algo = ...
+ *       Crea una caja con nombre donde se guarda un valor. "var" es la forma
+ *       antigua de declararla; aqui se usa para que el codigo sea compatible
+ *       con cualquier version del motor de Apps Script.
+ *
+ *   return algo;
+ *       Devuelve un valor como resultado de la funcion y termina ahi mismo.
+ *       Lo que hay debajo de un "return" ya no se ejecuta.
+ *
+ *   throw new Error('mensaje');
+ *       Lanza un error a proposito: la ejecucion se corta y el mensaje se ve en
+ *       el registro (Ver > Registro de ejecuciones). Se usa para avisar de algo
+ *       que no debe pasar en silencio, como una columna que ha desaparecido.
+ *
+ *   try { ... } catch (err) { ... }
+ *       "Intenta esto; si falla, haz esto otro en vez de romperse". El error
+ *       queda en la variable "err" y ahi se puede leer err.message.
+ *
+ *   lista.forEach(function (x) { ... })
+ *       "Para cada elemento de la lista, haz esto". Es la forma de recorrer una
+ *       lista sin escribir un bucle a mano.
+ *
+ *   lista.map(function (x) { ... return y; })
+ *       "Convierte cada elemento de la lista en otra cosa". Devuelve una lista
+ *       nueva del mismo tamano, transformada.
+ *
+ *   lista.filter(function (x) { ... })
+ *       "Quedate solo con los elementos que cumplan la condicion". Devuelve una
+ *       lista nueva mas corta.
+ *
+ *   funcion_(...)
+ *       El guion bajo al final es solo una convencion de nombre: significa
+ *       "funcion interna, no la pulses tu en el editor". No cambia como
+ *       funciona; sirve para distinguir de un vistazo los botones de verdad.
+ *
+ *   OBJETOS DE GOOGLE QUE APARECEN (todos empiezan por mayuscula)
+ *       SpreadsheetApp : abre hojas de calculo por su ID.
+ *       DriveApp       : accede a ficheros y carpetas de Drive.
+ *       Sheet          : una pestana concreta dentro de una hoja.
+ *       Range          : un trozo rectangular de celdas.
+ *       LockService    : impide que el script se ejecute dos veces a la vez.
+ *       MailApp        : manda correos.
+ *       Logger         : escribe en el registro de ejecuciones.
+ *       ScriptApp      : gestiona los disparadores automaticos (triggers).
+ *       Utilities      : utilidades varias, como formatear fechas.
+ *
+ *   getRange(fila, columna, numeroDeFilas, numeroDeColumnas)
+ *       Selecciona un rectangulo de celdas. Ojo: las filas y columnas empiezan
+ *       a contar en 1 (no en 0). getRange(2, 1, 10, 3) = desde la fila 2,
+ *       columna 1 (A), 10 filas hacia abajo y 3 columnas a la derecha (A:C).
+ *
+ * ----------------------------------------------------------------------------
+ * GARANTIAS DE DISENO
+ * ----------------------------------------------------------------------------
+ *   - Idempotente: reejecutar no duplica. Si el periodo ya existe, se borra y
+ *     se reescribe (upsert).
+ *   - Cabeceras mapeadas POR NOMBRE, nunca por posicion. Si el origen reordena
+ *     sus columnas, los datos siguen cayendo en el sitio correcto.
  *   - Columnas nuevas en el origen: se anaden solas al maestro.
  *   - Columnas que faltan: si faltan en el fichero MAS RECIENTE se considera
  *     renombrado/borrado y aborta. Si faltan en un fichero antiguo (la columna
@@ -25,16 +94,20 @@
  *   - Solo hojas de Google: si en la carpeta aparece otro tipo de fichero con
  *     nombre de periodo, se rechaza con error explicito.
  *
- * Puesta en marcha
+ * ----------------------------------------------------------------------------
+ * PUESTA EN MARCHA (en este orden)
+ * ----------------------------------------------------------------------------
  *   1. Rellena CONFIG (IDs, correo y entidades).
- *   2. Ejecuta dryRun() y revisa el log: ficheros detectados y estado del maestro.
- *   3. Ejecuta ingestManual() con un periodo concreto para la primera carga.
+ *   2. Ejecuta dryRun() y revisa el registro: ficheros detectados y estado.
+ *   3. Pon un periodo en MANUAL_PERIOD y ejecuta ingestManual().
  *   4. Ejecuta installTrigger() para dejarlo automatico.
  *   5. Comparte el maestro SOLO EN LECTURA. Nadie debe editar ni formatear ese
  *      fichero: aplicar formato a columnas enteras lo devuelve al problema de
  *      memoria del navegador.
  *
- * Notas de mantenimiento
+ * ----------------------------------------------------------------------------
+ * NOTAS DE MANTENIMIENTO
+ * ----------------------------------------------------------------------------
  *   - El maestro debe vivir en Mi unidad, no en una unidad compartida: el
  *     conector de Google Sheets de Looker Studio no accede a unidades compartidas.
  *   - El scope de Drive es de solo lectura: el script nunca modifica ni borra
@@ -43,6 +116,8 @@
  *     ejecucion: hazlo por tandas con ingestPeriod('AAAA-Wnn').
  *   - Los numeros con formato local ("1.234,56") viajan como texto. Si Looker
  *     los necesita como numero, arreglalo en el origen.
+ *   - Este fichero esta escrito sin tildes ni enes a proposito, para que no haya
+ *     problemas de codificacion al copiarlo y pegarlo.
  * ============================================================================
  */
 
@@ -50,39 +125,54 @@
 // CONFIGURACION  -  lo unico que tienes que editar
 // ============================================================================
 
+// CONFIG es el objeto (la caja grande) con todos los ajustes. Solo cambia los
+// valores que hay a la derecha de cada dos puntos. No borres las comas.
 var CONFIG = {
 
-  // Fichero maestro (el ID aparece en la URL: /spreadsheets/d/<ID>/edit)
+  // Fichero maestro. El ID es la parte larga que aparece en su URL, entre
+  // /spreadsheets/d/ y /edit. Debe estar en Mi unidad, no en unidad compartida.
   masterFileId: 'PON_AQUI_EL_ID_DEL_MAESTRO',
 
-  // Carpeta de Drive con los ficheros de periodo. No es recursiva.
+  // Carpeta de Drive donde estan los ficheros de periodo. Solo mira los ficheros
+  // que cuelgan directamente de ella; no entra en subcarpetas.
   sourceFolderId: 'PON_AQUI_EL_ID_DE_LA_CARPETA',
 
-  // Avisos de error
+  // Correo al que llega el aviso cuando una ejecucion falla.
   notifyEmail: 'tu.correo@empresa.com',
 
+  // Zona horaria usada para interpretar fechas y para la hora del trigger.
   timezone: 'Europe/Madrid',
 
-  // Periodos que se conservan por pestana destino. 6 a 12 segun tu caso.
+  // Cuantos periodos se conservan en cada pestana del maestro. Los mas viejos
+  // se borran automaticamente. 12 semanas son unos 3 meses de historico.
   windowPeriods: 12,
 
-  // 'ISO_WEEK' -> nombres tipo 2026-W47   |   'MONTH' -> nombres tipo 2026-11
+  // Como se llaman los periodos:
+  //   'ISO_WEEK' -> 2026-W47  (semanal; la semana ISO empieza en lunes)
+  //   'MONTH'    -> 2026-11   (mensual)
   periodFormat: 'ISO_WEEK',
 
-  // Opcional. Si lo dejas vacio se deriva de periodFormat.
+  // Patron del nombre de fichero. Si lo dejas vacio se deduce solo de
+  // periodFormat. Solo lo cambias si tus ficheros se llaman de otra forma.
   // Ejemplos: '^(\\d{4})-W(\\d{2})$'  o  '^(\\d{4})-(\\d{2})$'
+  // Los dobles backslash son obligatorios: es la forma de escribir \d en texto.
   filenamePattern: '',
 
-  // Fila donde estan las cabeceras en las pestanas de origen
+  // Fila donde empiezan las cabeceras en las pestanas de origen. Casi siempre 1.
   headerRow: 1,
 
-  // Aborta si el origen trae celdas con error (#REF!, #N/A, ...)
+  // Si es true, la ejecucion se corta cuando encuentra celdas con error
+  // (#REF!, #N/A, #DIV/0!...). Mejor dejarlo en true: no quieres archivar basura.
   failOnErrorCells: true,
 
   // Una entrada por cada pestana de datos que quieras archivar.
-  // destino : nombre de la pestana en el maestro (se crea si no existe)
-  // origen  : nombre de la pestana en el fichero de periodo
-  // headerRow: opcional, sobrescribe CONFIG.headerRow para esta entidad
+  // Cada entrada es un objeto con tres campos posibles:
+  //   destino  : nombre de la pestana en el maestro. Si no existe, se crea.
+  //              Es el nombre que veras luego en Looker Studio.
+  //   origen   : nombre de la pestana dentro del fichero de periodo.
+  //   headerRow: opcional. Solo si esa pestana tiene las cabeceras en otra fila
+  //              distinta de CONFIG.headerRow.
+  // Puedes tener tantas entradas como necesites; con dejar las que uses basta.
   entities: [
     { destino: 'entidad_a', origen: 'Hoja 1' },
     { destino: 'entidad_b', origen: 'Hoja 2' },
@@ -90,42 +180,80 @@ var CONFIG = {
   ]
 };
 
-// Periodo que usa ingestManual(). Cambialo y pulsa Ejecutar.
+// Periodo que usa ingestManual() cuando lo pulsas a mano. Cambialo aqui y pulsa
+// Ejecutar. El formato tiene que coincidir con periodFormat: 2026-W47 o 2026-11.
 var MANUAL_PERIOD = '2026-W47';
 
 // ============================================================================
-// CONSTANTES INTERNAS
+// CONSTANTES INTERNAS  -  no hace falta tocarlas
 // ============================================================================
 
+// Columnas que el script pone siempre al principio de cada pestana del maestro.
+// El orden importa: es el contrato con Looker Studio y no debe cambiar.
 var META_HEADERS = ['periodo', 'anio', 'semana', 'fecha_reporte'];
+
+// Columna que se pone siempre al final: cuando se copio esa fila al maestro.
 var CACHE_HEADER = 'fecha_carga';
+
+// Cuanto espera (en milisegundos) si ya hay otra ejecucion en marcha antes de
+// rendirse. 30000 = 30 segundos.
 var LOCK_WAIT_MS = 30000;
+
+// Identificador interno que usa Google para decir "esto es una hoja de calculo".
 var SHEETS_MIME = 'application/vnd.google-apps.spreadsheet';
 
 // ============================================================================
-// PUNTOS DE ENTRADA
+// PUNTOS DE ENTRADA  -  las funciones que tu pulsas o que lanza el trigger
 // ============================================================================
+//
+// Todo lo que empieza por "function" y NO acaba en guion bajo es un boton que
+// puedes ejecutar desde el editor de Apps Script (desplegable de funciones +
+// boton Ejecutar) o que puede lanzar un trigger automatico.
 
-/** Trigger automatico: procesa solo los periodos que falten. */
+/**
+ * QUE HACE: ejecucion automatica del dia a dia. Recorre la carpeta y carga en el
+ *           maestro solo los periodos que todavia no estan dentro. Si un periodo
+ *           ya esta, lo salta. Es lo que lanza el trigger semanal o mensual.
+ * CUANDO SE EJECUTA: solo por el trigger automatico (o a mano, si quieres
+ *           simular lo que hara el trigger).
+ * NO HACE: no rehace periodos ya cargados. Para eso esta rebuildAll().
+ */
 function ingestScheduled() {
+  // execute_ es el envoltorio que pone el candado y manda correo si algo falla.
+  // Le pasamos una funcion anonima: el trabajo real que debe ejecutar.
   execute_(function () {
     return ingest_({ onlyMissing: true });
   });
 }
 
-/** Carga inicial o reconstruccion: reprocesa todos los ficheros de la carpeta. */
+/**
+ * QUE HACE: carga inicial o reconstruccion completa. Vuelve a procesar todos los
+ *           ficheros de la carpeta, reescribiendo cada periodo que encuentre.
+ * CUANDO SE EJECUTA: la primera vez que montas el maestro, o si sospechas que
+ *           hay periodos mal cargados.
+ * OJO: con muchos periodos puede superar el limite de 6 minutos por ejecucion.
+ *      En ese caso, hazlo por tandas con ingestPeriod('2026-W40') y siguientes.
+ */
 function rebuildAll() {
   execute_(function () {
     return ingest_({ onlyMissing: false });
   });
 }
 
-/** Rehace un unico periodo (util tras corregir un fichero ya cargado). */
+/**
+ * QUE HACE: rehace UN periodo concreto, el que tengas en MANUAL_PERIOD.
+ * CUANDO SE EJECUTA: cuando alguien corrige un fichero ya cargado y quieres
+ *           reflejar la correccion sin tocar el resto.
+ */
 function ingestManual() {
   ingestPeriod(MANUAL_PERIOD);
 }
 
-/** Rehace el periodo indicado, aunque ya estuviera cargado. */
+/**
+ * QUE HACE: rehace el periodo que le pases entre comillas como argumento.
+ * CUANDO SE EJECUTA: desde el editor, cambiando MANUAL_PERIOD, o desde otro
+ *           script llamandolo como ingestPeriod('2026-W47').
+ */
 function ingestPeriod(periodo) {
   execute_(function () {
     return ingest_({ onlyMissing: false, onlyPeriod: String(periodo) });
@@ -133,28 +261,44 @@ function ingestPeriod(periodo) {
 }
 
 /**
- * Diagnostico sin escribir nada: ficheros detectados, periodos y estado del
- * maestro. Es lo primero que debes ejecutar.
+ * QUE HACE: diagnostico de solo lectura. No escribe nada en ningun sitio: solo
+ *           mira la carpeta y el maestro, y escribe un resumen en el registro.
+ * CUANDO SE EJECUTA: siempre lo PRIMERO, antes de instalar el trigger. Sirve
+ *           para comprobar que los IDs son correctos y que el script ve los
+ *           ficheros y las pestanas que esperas.
+ * COMO VER EL RESULTADO: Ver > Registro de ejecuciones (o Ctrl+Enter).
  */
 function dryRun() {
   var master = SpreadsheetApp.openById(CONFIG.masterFileId);
   var folder = DriveApp.getFolderById(CONFIG.sourceFolderId);
   var files = listSourceFiles_(folder);
+
+  // "lines" es una lista de textos; al final se unen todos con saltos de linea.
   var lines = [];
 
   lines.push('Formato de periodo: ' + CONFIG.periodFormat + ' | ventana: ' + CONFIG.windowPeriods);
   lines.push('Ficheros detectados en la carpeta: ' + files.length);
+
+  // Una linea por fichero: nombre, periodo deducido y fecha que se archivara.
   files.forEach(function (f) {
     lines.push('  - ' + f.name + '  ->  ' + f.periodo + '  (fecha_reporte ' + formatDate_(fechaReporte_(f.periodo)) + ')');
   });
+
   lines.push('');
   lines.push('Estado del maestro:');
+
+  // Una linea por entidad: si la pestana existe, cuantas filas y periodos tiene.
   CONFIG.entities.forEach(function (e) {
     var sheet = master.getSheetByName(e.destino);
+
+    // Si la pestana no existe todavia, se creara en la primera carga real.
     if (!sheet) {
       lines.push('  "' + e.destino + '" (origen "' + e.origen + '"): no existe, se creara');
       return;
     }
+
+    // Se protege con try/catch para que una pestana mal montada no impida
+    // diagnosticar las demas: se informa del problema y se sigue.
     try {
       var periods = distinct_(readPeriodColumn_(sheet));
       lines.push('  "' + e.destino + '" (origen "' + e.origen + '"): ' + Math.max(sheet.getLastRow() - 1, 0) +
@@ -164,25 +308,40 @@ function dryRun() {
     }
   });
 
+  // join('\n') pega todas las lineas separandolas con un salto de linea.
   var out = lines.join('\n');
   Logger.log(out);
   return out;
 }
 
-/** Deja el trigger automatico (lunes 06:00 o dia 1 06:00 segun periodFormat). */
+/**
+ * QUE HACE: deja programada la ejecucion automatica (el "trigger").
+ * CUANDO SE EJECUTA: una sola vez, cuando ya has probado dryRun e ingestManual.
+ * DETALLE: lunes a las 06:00 si es semanal; dia 1 a las 06:00 si es mensual.
+ *          Antes de crear uno nuevo borra el anterior, para no duplicar.
+ */
 function installTrigger() {
   removeTriggers();
+
+  // Se va montando el trigger por partes: primero "que funcion llamar" y con
+  // que zona horaria; luego la frecuencia.
   var builder = ScriptApp.newTrigger('ingestScheduled').timeBased().inTimezone(CONFIG.timezone);
   if (CONFIG.periodFormat === 'MONTH') {
     builder.onMonthDay(1).atHour(6).create();
   } else {
     builder.onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(6).create();
   }
+
   Logger.log('Trigger instalado.');
 }
 
-/** Quita el trigger automatico. */
+/**
+ * QUE HACE: borra el trigger automatico de este script, si existe.
+ * CUANDO SE EJECUTA: si quieres parar la automatizacion sin borrar el proyecto.
+ */
 function removeTriggers() {
+  // getProjectTriggers() devuelve todos los triggers del proyecto. Solo se
+  // borran los que llaman a ingestScheduled: el resto se deja intacto.
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (t.getHandlerFunction() === 'ingestScheduled') {
       ScriptApp.deleteTrigger(t);
@@ -193,32 +352,61 @@ function removeTriggers() {
 // ============================================================================
 // MOTOR
 // ============================================================================
+//
+// A partir de aqui son funciones internas (acaban en guion bajo). No las pulses
+// a mano: las llaman las de arriba.
 
 /**
- * Envoltorio comun: lock de ejecucion, aviso por correo ante error y relanzado
- * para que la ejecucion quede marcada como fallida.
+ * QUE HACE: envuelve cualquier trabajo en tres protecciones comunes.
+ *   1. Un candado (lock) para que dos ejecuciones no escriban a la vez.
+ *   2. Si el trabajo termina bien, guarda el resumen en el registro.
+ *   3. Si falla, manda un correo con el error y vuelve a lanzarlo para que la
+ *      ejecucion quede marcada como fallida en el panel de Apps Script.
+ * RECIBE: fn, la funcion con el trabajo real.
  */
 function execute_(fn) {
   var lock = LockService.getScriptLock();
+
+  // tryLock devuelve false si otro proceso tiene el candado. En ese caso no se
+  // espera indefinidamente: se aborta, porque escribir dos veces seria peor.
   if (!lock.tryLock(LOCK_WAIT_MS)) {
     throw new Error('Ya hay una ejecucion en curso del historico. Abortado para no escribir dos veces.');
   }
+
   try {
+    // Aqui se ejecuta el trabajo de verdad.
     var summary = fn();
     Logger.log(JSON.stringify(summary, null, 2));
     return summary;
   } catch (err) {
+    // "err && err.stack" significa: si hay error y tiene traza, usa la traza
+    // (que dice la linea exacta); si no, usa el texto del error.
     notify_('ERROR', (err && err.stack) ? err.stack : String(err));
     throw err;
   } finally {
+    // "finally" se ejecuta siempre, haya ido bien o mal: asi el candado nunca
+    // se queda echado por un fallo.
     lock.releaseLock();
   }
 }
 
+/**
+ * QUE HACE: el recorrido principal. Lee la carpeta, decide que periodos hay que
+ *           cargar y los va archivando entidad por entidad.
+ * RECIBE: opts.onlyMissing (true = saltar periodos ya cargados) y
+ *         opts.onlyPeriod (cargar solo ese periodo).
+ * DEVUELVE: un resumen con lo cargado, lo omitido, los fallos y los avisos.
+ */
 function ingest_(opts) {
+  // Si no llega nada, se usa un objeto vacio, para poder leer opts.onlyMissing
+  // sin que el programa falle.
   opts = opts || {};
+
   var master = SpreadsheetApp.openById(CONFIG.masterFileId);
   var folder = DriveApp.getFolderById(CONFIG.sourceFolderId);
+
+  // Lista de ficheros de la carpeta que cumplen el patron, ordenada del periodo
+  // mas antiguo al mas reciente.
   var allFiles = listSourceFiles_(folder);
 
   if (!allFiles.length) {
@@ -229,6 +417,7 @@ function ingest_(opts) {
   // fichero puede provocar un aborto por columna desaparecida.
   var latestPeriod = allFiles[allFiles.length - 1].periodo;
 
+  // Si se pide un periodo concreto, se queda solo con ese fichero.
   var files = allFiles;
   if (opts.onlyPeriod) {
     files = allFiles.filter(function (f) { return f.periodo === opts.onlyPeriod; });
@@ -238,6 +427,7 @@ function ingest_(opts) {
   }
 
   // Cache de periodos ya presentes por entidad, para no leer la columna N veces.
+  // periodCache['entidad_a']['2026-W47'] = true significa "ese periodo ya esta".
   var periodCache = {};
   CONFIG.entities.forEach(function (e) {
     periodCache[e.destino] = {};
@@ -246,17 +436,25 @@ function ingest_(opts) {
     });
   });
 
+  // Aqui se va apuntando lo que pasa, para el resumen final y el correo.
   var summary = { ok: [], skipped: [], failed: [], warned: [] };
 
+  // ---- Bucle principal: un fichero de periodo cada vez ----
   files.forEach(function (entry) {
+    // De las entidades configuradas, cuales hay que cargar para este fichero.
+    // Con onlyMissing, se descartan las que ya tienen ese periodo.
     var pending = CONFIG.entities.filter(function (e) {
       return !(opts.onlyMissing && periodCache[e.destino][entry.periodo]);
     });
+
     if (!pending.length) {
       summary.skipped.push(entry.periodo);
       return;
     }
 
+    // Se abre el fichero de origen una sola vez y se reutiliza para todas sus
+    // pestanas. Si no se puede abrir, se apunta el fallo y se sigue con el
+    // siguiente fichero: un fichero roto no debe parar los demas.
     var srcSs;
     try {
       srcSs = openSource_(entry.id);
@@ -265,6 +463,7 @@ function ingest_(opts) {
       return;
     }
 
+    // Un fallo en una entidad tampoco debe impedir cargar las otras.
     pending.forEach(function (e) {
       try {
         ingestEntity_(master, srcSs, e, entry, entry.periodo === latestPeriod, summary.warned);
@@ -276,7 +475,7 @@ function ingest_(opts) {
     });
   });
 
-  // Retencion al final, una vez por entidad.
+  // Retencion al final, una vez por entidad: aqui se borran los periodos viejos.
   CONFIG.entities.forEach(function (e) {
     try {
       applyRetention_(master, e);
@@ -285,12 +484,16 @@ function ingest_(opts) {
     }
   });
 
+  // Fuerza a que todos los cambios pendientes se escriban antes de terminar.
   SpreadsheetApp.flush();
 
+  // Los avisos no son errores: se registran pero la ejecucion se considera bien.
   if (summary.warned.length) {
     Logger.log('Avisos (' + summary.warned.length + '):\n' + summary.warned.join('\n'));
   }
 
+  // Si hubo fallos, se lanza un error con todos juntos. execute_ lo mandara por
+  // correo y el panel de Apps Script marcara la ejecucion como fallida.
   if (summary.failed.length) {
     throw new Error('Fallos (' + summary.failed.length + '):\n' + summary.failed.join('\n') +
       '\n\nCargados: ' + summary.ok.length + ' | Omitidos: ' + summary.skipped.length +
@@ -300,29 +503,51 @@ function ingest_(opts) {
 }
 
 /**
- * Archiva una entidad de un fichero de periodo en su pestana del maestro.
- * isLatest: true si este fichero es el mas reciente de la carpeta; solo entonces
- * una columna ausente se trata como renombrado/borrado y aborta.
+ * QUE HACE: archiva una entidad de un fichero de periodo en su pestana del
+ *           maestro. Es el corazon del script.
+ * RECIBE:
+ *   master    : la hoja de calculo maestra ya abierta.
+ *   srcSs     : la hoja de calculo de origen ya abierta.
+ *   entity    : la entrada de CONFIG.entities que toca ({destino, origen}).
+ *   entry     : datos del fichero ({periodo, anio, semana, fechaReporte}).
+ *   isLatest  : true si este fichero es el mas reciente de la carpeta; solo
+ *               entonces una columna ausente se trata como renombrado y aborta.
+ *   warnings  : lista compartida donde se apuntan los avisos no criticos.
+ * PASOS: preparar pestana destino, leer origen, validar, alinear columnas,
+ *        borrar el periodo si ya estaba y escribir de una sola vez.
  */
 function ingestEntity_(master, srcSs, entity, entry, isLatest, warnings) {
+  // 1. Pestana destino del maestro (se crea si no existe).
   var masterSheet = ensureMasterTab_(master, entity);
+
+  // 2. Pestana de origen. resolveSheetName_ tolera mayusculas, espacios y
+  //    tildes al comparar nombres, y falla con un mensaje util si hay dudas.
   var srcSheet = srcSs.getSheetByName(resolveSheetName_(srcSs, entity.origen));
 
   var headerRow = entity.headerRow || CONFIG.headerRow;
   var lastRow = srcSheet.getLastRow();
   var lastCol = srcSheet.getLastColumn();
+
+  // Si la pestana esta vacia o solo tiene cabeceras, no hay nada que archivar.
   if (lastRow <= headerRow || lastCol === 0) {
     throw new Error('la pestana "' + entity.origen + '" no tiene datos bajo la fila ' + headerRow);
   }
 
+  // 3. Se lee el bloque entero de una vez (mucho mas rapido que celda a celda).
   var block = srcSheet.getRange(headerRow, 1, lastRow - headerRow + 1, lastCol).getValues();
+
+  // shift() saca la primera fila del bloque (las cabeceras) y deja el resto.
+  // A cada nombre se le quitan los espacios sobrantes.
   var srcHeader = block.shift().map(function (h) { return String(h).trim(); });
   assertHeader_(srcHeader, entity.origen);
 
+  // 4. Si alguna celda trae un error de formula, se aborta antes de archivar.
   if (CONFIG.failOnErrorCells) {
     assertNoErrors_(block, entity.origen, headerRow);
   }
 
+  // 5. Se descartan las filas totalmente vacias que suelen quedar al final.
+  //    some() devuelve true en cuanto encuentra una celda con algo dentro.
   var rows = block.filter(function (r) {
     return r.some(function (c) { return c !== '' && c !== null; });
   });
@@ -330,9 +555,16 @@ function ingestEntity_(master, srcSs, entity, entry, isLatest, warnings) {
     throw new Error('la pestana "' + entity.origen + '" no tiene filas con datos');
   }
 
+  // 6. Se alinean las columnas con el maestro (anade las nuevas, valida las
+  //    que faltan) y se obtiene la cabecera definitiva del destino.
   var masterHeader = ensureColumns_(masterSheet, srcHeader, isLatest, warnings, entity.destino, entry.periodo);
+
+  // La misma marca de tiempo para todas las filas de esta carga.
   var now = new Date();
 
+  // 7. Se construye la tabla final: por cada fila de origen y por cada columna
+  //    del maestro, se decide que valor va ahi. Esto es lo que hace que el
+  //    orden de las columnas del origen deje de importar.
   var payload = rows.map(function (r) {
     return masterHeader.map(function (col) {
       if (col === 'periodo') return entry.periodo;
@@ -340,12 +572,17 @@ function ingestEntity_(master, srcSs, entity, entry, isLatest, warnings) {
       if (col === 'semana') return entry.semana;
       if (col === 'fecha_reporte') return entry.fechaReporte;
       if (col === CACHE_HEADER) return now;
+
+      // Columna normal: se busca por su nombre en la cabecera de origen.
+      // Si no estuviera, se deja vacia en vez de desplazar los datos.
       var i = srcHeader.indexOf(col);
       return i === -1 ? '' : r[i];
     });
   });
 
-  // Upsert: fuera las filas previas de este periodo, luego append de una sola escritura.
+  // Upsert: fuera las filas previas de este periodo, luego append de una sola
+  // escritura. getLastRow() se consulta despues de borrar, para escribir justo
+  // debajo de la ultima fila que queda.
   deletePeriodRows_(masterSheet, entry.periodo);
   var startRow = masterSheet.getLastRow() + 1;
   masterSheet.getRange(startRow, 1, payload.length, masterHeader.length).setValues(payload);
@@ -355,13 +592,23 @@ function ingestEntity_(master, srcSs, entity, entry, isLatest, warnings) {
 // ESTRUCTURA DEL MAESTRO
 // ============================================================================
 
+/**
+ * QUE HACE: devuelve la pestana destino, creandola si no existe, y comprueba
+ *           que su cabecera es la esperada.
+ * POR QUE: si alguien renombra o reordena las columnas del maestro a mano, el
+ *          script debe pararse en vez de escribir en el sitio equivocado.
+ */
 function ensureMasterTab_(master, entity) {
   var sheet = master.getSheetByName(entity.destino);
+
+  // No existe: se crea vacia y se le pone la cabecera minima.
   if (!sheet) {
     sheet = master.insertSheet(entity.destino);
     Logger.log('Creada la pestana destino "' + entity.destino + '".');
   }
 
+  // Hoja recien creada o completamente vacia: se escribe la cabecera base
+  // (las columnas de datos se anaden despues, al leer el primer origen).
   if (sheet.getLastRow() === 0) {
     var header = META_HEADERS.concat([CACHE_HEADER]);
     sheet.getRange(1, 1, 1, header.length).setValues([header]);
@@ -369,6 +616,7 @@ function ensureMasterTab_(master, entity) {
     return sheet;
   }
 
+  // La pestana ya tenia contenido: se valida que empiece como debe.
   var current = readHeader_(sheet);
   for (var i = 0; i < META_HEADERS.length; i++) {
     if (current[i] !== META_HEADERS[i]) {
@@ -384,6 +632,11 @@ function ensureMasterTab_(master, entity) {
   return sheet;
 }
 
+/**
+ * QUE HACE: lee la fila 1 (las cabeceras) y la devuelve como lista de textos.
+ * DETALLE: getValues() devuelve una tabla de filas x columnas; [0] toma la
+ *          primera fila. trim() quita espacios sobrantes a cada nombre.
+ */
 function readHeader_(sheet) {
   var lastCol = sheet.getLastColumn();
   if (lastCol === 0) return [];
@@ -391,16 +644,25 @@ function readHeader_(sheet) {
 }
 
 /**
- * Alinea las columnas del origen con las del maestro.
+ * QUE HACE: alinea las columnas del origen con las del maestro.
  *   - Aditivas: se anaden al maestro.
  *   - Ausentes en el fichero mas reciente: aborta (renombrado o borrado real).
  *   - Ausentes en un fichero antiguo: se rellenan vacias y se avisa.
+ * DEVUELVE: la cabecera definitiva del maestro, ya con las columnas nuevas.
  */
 function ensureColumns_(sheet, srcHeader, isLatest, warnings, destino, periodo) {
   var header = readHeader_(sheet);
-  var lastDataPos = header.length - 1; // 1-based: ultima columna de datos (justo antes de fecha_carga)
+
+  // Posicion (empezando en 1) de la ultima columna de datos: justo antes de
+  // fecha_carga, que siempre va al final.
+  var lastDataPos = header.length - 1;
+
+  // slice(desde, hasta) coge un trozo de la lista: aqui, solo las columnas de
+  // datos del maestro, sin las cuatro de control ni fecha_carga.
   var masterData = header.slice(META_HEADERS.length, header.length - 1);
 
+  // Columnas que el maestro ya tiene y el origen no trae.
+  // indexOf devuelve -1 cuando no encuentra el nombre.
   var missing = masterData.filter(function (c) { return srcHeader.indexOf(c) === -1; });
   if (missing.length) {
     if (isLatest) {
@@ -412,6 +674,8 @@ function ensureColumns_(sheet, srcHeader, isLatest, warnings, destino, periodo) 
     }
   }
 
+  // Columnas nuevas: estan en el origen y no en el maestro. Se insertan antes
+  // de fecha_carga, para que esa siga siendo la ultima columna.
   var newCols = srcHeader.filter(function (c) { return c !== '' && header.indexOf(c) === -1; });
   if (newCols.length) {
     sheet.insertColumnsAfter(lastDataPos, newCols.length);
@@ -421,6 +685,11 @@ function ensureColumns_(sheet, srcHeader, isLatest, warnings, destino, periodo) 
   return readHeader_(sheet);
 }
 
+/**
+ * QUE HACE: devuelve el numero de columna (empezando en 1) donde esta "periodo".
+ * POR QUE: en vez de suponer que es la 1, se busca por nombre; si algun dia
+ *          cambia el orden, el script sigue acertando.
+ */
 function periodoColumn_(sheet) {
   var idx = readHeader_(sheet).indexOf('periodo');
   if (idx === -1) {
@@ -429,6 +698,11 @@ function periodoColumn_(sheet) {
   return idx + 1;
 }
 
+/**
+ * QUE HACE: devuelve la lista de periodos de la pestana, en el orden en que
+ *          estan escritos (una entrada por fila, repetidos incluidos).
+ * DETALLE: empieza en la fila 2 porque la 1 son las cabeceras.
+ */
 function readPeriodColumn_(sheet) {
   if (!sheet || sheet.getLastRow() < 2) return [];
   var col = periodoColumn_(sheet);
@@ -437,6 +711,13 @@ function readPeriodColumn_(sheet) {
   });
 }
 
+/**
+ * QUE HACE: borra del maestro todas las filas de un periodo concreto.
+ * PARA QUE: es la primera mitad del upsert; la segunda es volver a escribirlas.
+ * DEVUELVE: cuantas filas se han borrado.
+ * DETALLE: se suman 2 al indice porque la lista empieza en la fila 2 (la 1 es
+ *          la cabecera y no se toca nunca).
+ */
 function deletePeriodRows_(sheet, periodo) {
   var periods = readPeriodColumn_(sheet);
   var rows = [];
@@ -447,16 +728,26 @@ function deletePeriodRows_(sheet, periodo) {
   return rows.length;
 }
 
-/** Retencion: conserva los ultimos CONFIG.windowPeriods periodos de la pestana. */
+/**
+ * QUE HACE: retencion. Se queda con los CONFIG.windowPeriods periodos mas
+ *          recientes y borra las filas de todos los demas.
+ * DETALLE: sort() ordena los periodos como texto; funciona porque van con ceros
+ *          a la izquierda (2026-W07 < 2026-W47) y el mismo formato siempre.
+ */
 function applyRetention_(master, entity) {
   var sheet = master.getSheetByName(entity.destino);
   if (!sheet || sheet.getLastRow() < 2) return;
 
   var periods = readPeriodColumn_(sheet);
   var ordered = distinct_(periods).sort();
+
+  // Si aun no hay mas periodos que la ventana, no hay nada que borrar.
   if (ordered.length <= CONFIG.windowPeriods) return;
 
+  // Los que se conservan son los ultimos de la lista ordenada.
   var keep = ordered.slice(ordered.length - CONFIG.windowPeriods);
+
+  // Se marcan las filas de los periodos que NO estan en "keep".
   var rows = [];
   periods.forEach(function (p, i) {
     if (keep.indexOf(p) === -1) rows.push(i + 2);
@@ -466,38 +757,67 @@ function applyRetention_(master, entity) {
     ' periodos [' + keep.join(', ') + ']');
 }
 
-/** Borra filas por indice agrupando bloques consecutivos y de abajo arriba. */
+/**
+ * QUE HACE: borra filas por numero, agrupando las consecutivas y de abajo hacia
+ *          arriba.
+ * POR QUE ASI: borrar fila a fila es lentisimo, y borrar de arriba abajo
+ *          desplaza los numeros de las filas siguientes y se borraria lo que no
+ *          toca. De abajo arriba, los numeros de arriba no cambian.
+ * EJEMPLO: filas [2,3,5,7] -> borra el bloque 2-3, luego la 5, luego la 7.
+ */
 function deleteRowsGrouped_(sheet, rows) {
   if (!rows || !rows.length) return;
+
+  // slice() copia la lista para no modificar la original; sort compara de mayor
+  // a menor (b - a) para ir de abajo arriba.
   var sorted = rows.slice().sort(function (a, b) { return b - a; });
+
   var i = 0;
   while (i < sorted.length) {
     var end = sorted[i];
     var start = end;
+
+    // Se amplia el bloque mientras la fila siguiente sea justo la anterior.
     var j = i + 1;
     while (j < sorted.length && sorted[j] === start - 1) {
       start = sorted[j];
       j++;
     }
+
     sheet.deleteRows(start, end - start + 1);
     i = j;
   }
 }
 
 // ============================================================================
-// ORIGENES
+// ORIGENES  -  leer la carpeta y deducir el periodo de cada fichero
 // ============================================================================
 
+/**
+ * QUE HACE: recorre la carpeta y devuelve solo los ficheros cuyo nombre encaja
+ *          con el patron, con su periodo ya deducido.
+ * DEVUELVE: lista de objetos {id, name, periodo, anio, semana, fechaReporte},
+ *          ordenada del periodo mas antiguo al mas reciente.
+ * DETALLE: la extension se quita antes de comparar, asi que funciona igual con
+ *          "2026-W47" que con "2026-W47.xlsx" o "2026-W47 copia".
+ */
 function listSourceFiles_(folder) {
   var re = new RegExp(pattern_());
   var it = folder.getFiles();
   var out = [];
+
+  // getFiles() devuelve un "iterador": se recorre con hasNext() y next().
   while (it.hasNext()) {
     var file = it.next();
+
+    // Quita la extension final, si la hay (punto + letras o numeros).
     var base = file.getName().replace(/\.[A-Za-z0-9]+$/, '');
     var m = base.match(re);
+
+    // Si el nombre no encaja con el patron, se ignora sin avisar.
     if (!m) continue;
 
+    // m[1] es el ano y m[2] el numero de semana o de mes, segun el patron.
     var year = Number(m[1]);
     var num = Number(m[2]);
     var periodo = (CONFIG.periodFormat === 'MONTH') ? (m[1] + '-' + pad_(num)) : (m[1] + '-W' + pad_(num));
@@ -511,16 +831,27 @@ function listSourceFiles_(folder) {
       fechaReporte: fechaReporte_(periodo)
     });
   }
+
+  // Orden alfabetico del periodo, que con este formato equivale al cronologico.
   out.sort(function (a, b) { return a.periodo < b.periodo ? -1 : (a.periodo > b.periodo ? 1 : 0); });
   return out;
 }
 
+/**
+ * QUE HACE: devuelve el patron (expresion regular) que deben cumplir los
+ *          nombres de fichero. Si CONFIG.filenamePattern esta relleno, se usa
+ *          tal cual; si no, se deduce de periodFormat.
+ */
 function pattern_() {
   if (CONFIG.filenamePattern) return CONFIG.filenamePattern;
   return (CONFIG.periodFormat === 'MONTH') ? '^(\\d{4})-(\\d{2})$' : '^(\\d{4})-W(\\d{2})$';
 }
 
-/** Abre una hoja de Google y rechaza cualquier otro tipo de fichero. */
+/**
+ * QUE HACE: abre una hoja de Google y rechaza cualquier otro tipo de fichero.
+ * POR QUE: si en la carpeta se cuela un PDF o una hoja de Excel con nombre de
+ *          periodo, el mensaje de error dice exactamente que paso.
+ */
 function openSource_(fileId) {
   var file = DriveApp.getFileById(fileId);
   if (file.getMimeType() !== SHEETS_MIME) {
@@ -530,10 +861,19 @@ function openSource_(fileId) {
   return SpreadsheetApp.openById(fileId);
 }
 
+/**
+ * QUE HACE: busca una pestana por nombre dentro de una hoja y devuelve su nombre
+ *          real. Tolera diferencias de mayusculas, espacios y tildes.
+ * POR QUE: getSheetByName es estricto; asi un "Hoja 1" con un espacio de mas no
+ *          rompe la ejecucion.
+ * SI HAY DUDAS: falla y lista las pestanas disponibles, para que se vea al instante
+ *          cual era el nombre correcto.
+ */
 function resolveSheetName_(ss, wanted) {
   var target = normalize_(wanted);
   var matches = ss.getSheets().filter(function (s) { return normalize_(s.getName()) === target; });
   if (matches.length === 1) return matches[0].getName();
+
   var available = ss.getSheets().map(function (s) { return '"' + s.getName() + '"'; }).join(', ');
   throw new Error('no encuentro una unica pestana llamada "' + wanted + '". Disponibles: ' + available);
 }
@@ -542,7 +882,15 @@ function resolveSheetName_(ss, wanted) {
 // FECHAS Y PERIODOS
 // ============================================================================
 
-/** Primer dia (lunes) de una semana ISO, a mediodia UTC para evitar saltos de zona. */
+/**
+ * QUE HACE: convierte "ano + numero de semana ISO" en la fecha del lunes de esa
+ *          semana.
+ * POR QUE NO SE USA EL CALCULO FACIL: las semanas ISO no empiezan el 1 de enero;
+ *          la semana 1 es la que contiene el 4 de enero. Por eso el calculo
+ *          arranca en el 4 de enero, retrocede hasta su lunes y avanza semanas.
+ * DETALLE: se usa mediodia UTC para que ningun cambio de hora mueva la fecha un
+ *          dia arriba o abajo al guardarla en la hoja.
+ */
 function isoWeekToMonday_(year, week) {
   var jan4 = new Date(Date.UTC(year, 0, 4, 12, 0, 0));
   var dow = jan4.getUTCDay() || 7;
@@ -550,19 +898,33 @@ function isoWeekToMonday_(year, week) {
   return new Date(mondayW1.getTime() + (week - 1) * 7 * 86400000);
 }
 
+/**
+ * QUE HACE: convierte un periodo ("2026-W47" o "2026-11") en su fecha de
+ *          referencia, que es la que se archiva en la columna fecha_reporte.
+ *          Semanal -> el lunes de esa semana. Mensual -> el dia 1 del mes.
+ * PARA QUE: Looker Studio necesita una fecha de verdad para ordenar y para los
+ *          filtros de "ultimas N semanas/meses".
+ */
 function fechaReporte_(periodo) {
   if (CONFIG.periodFormat === 'MONTH') {
     var pm = periodo.split('-');
     return new Date(Date.UTC(Number(pm[0]), Number(pm[1]) - 1, 1, 12, 0, 0));
   }
+
   var pw = periodo.split('-W');
   var week = Number(pw[1]);
+
+  // Una semana ISO solo puede ir de 1 a 53; fuera de eso, el fichero esta mal.
   if (!(week >= 1 && week <= 53)) {
     throw new Error('semana ISO fuera de rango: ' + periodo);
   }
   return isoWeekToMonday_(Number(pw[0]), week);
 }
 
+/**
+ * QUE HACE: pasa una fecha a texto "ano-mes-dia" para poder mostrarla en el
+ *          registro de ejecuciones.
+ */
 function formatDate_(d) {
   return Utilities.formatDate(d, CONFIG.timezone, 'yyyy-MM-dd');
 }
@@ -571,18 +933,34 @@ function formatDate_(d) {
 // UTILIDADES
 // ============================================================================
 
+/**
+ * QUE HACE: deja un texto en su forma minima para poder comparar nombres:
+ *          minusculas, sin tildes, sin espacios de mas.
+ * SE USA PARA: que "Hoja 1", "hoja 1 " y "HOJA 1" se consideren lo mismo.
+ */
 function normalize_(s) {
   return String(s)
+    // NFD separa las tildes de las letras y esta linea las elimina.
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    // Varios espacios seguidos se convierten en uno solo.
     .replace(/\s+/g, ' ')
     .trim()
     .toLowerCase();
 }
 
+/**
+ * QUE HACE: completa con un cero a la izquierda los numeros de una cifra.
+ * PARA QUE: "9" se convierta en "09" y los periodos ordenen bien como texto
+ *          (2026-W09 va antes que 2026-W10).
+ */
 function pad_(n) {
   return (n < 10 ? '0' : '') + n;
 }
 
+/**
+ * QUE HACE: quita los elementos repetidos de una lista, conservando el orden.
+ * TECNICA: un objeto hace de lista de "ya vistos"; seen[v] es true si ya salio.
+ */
 function distinct_(arr) {
   var seen = {};
   var out = [];
@@ -595,6 +973,13 @@ function distinct_(arr) {
   return out;
 }
 
+/**
+ * QUE HACE: valida la cabecera de una pestana de origen antes de usarla.
+ * COMPRUEBA: que ningun nombre este vacio, que no haya dos columnas llamadas
+ *            igual, y que no se use un nombre reservado por el maestro
+ *            (periodo, anio, semana, fecha_reporte, fecha_carga).
+ * SI ALGO FALLA: lanza un error con el nombre de la pestana, para localizarlo.
+ */
 function assertHeader_(header, sheetName) {
   var seen = {};
   header.forEach(function (c) {
@@ -607,6 +992,8 @@ function assertHeader_(header, sheetName) {
     }
     seen[key] = true;
   });
+
+  // Recorre los nombres reservados y comprueba que el origen no use ninguno.
   META_HEADERS.concat([CACHE_HEADER]).forEach(function (reserved) {
     header.forEach(function (c) {
       if (normalize_(c) === reserved) {
@@ -616,9 +1003,16 @@ function assertHeader_(header, sheetName) {
   });
 }
 
+/**
+ * QUE HACE: busca celdas que contengan errores de formula (#REF!, #N/A...).
+ * POR QUE: si una formula del origen esta rota, es mejor parar que archivar el
+ *          error y arrastrarlo al maestro y a Looker.
+ * DETALLE: solo se listan las 5 primeras para que el mensaje sea legible.
+ */
 function assertNoErrors_(rows, sheetName, headerRow) {
   var pattern = /^#(REF|N\/A|DIV\/0|VALUE|NAME|NULL|NUM|ERROR)/;
   var bad = [];
+
   rows.forEach(function (row, ri) {
     row.forEach(function (cell) {
       if (typeof cell === 'string' && pattern.test(cell.trim())) {
@@ -626,11 +1020,17 @@ function assertNoErrors_(rows, sheetName, headerRow) {
       }
     });
   });
+
   if (bad.length) {
     throw new Error('celdas con error en la pestana "' + sheetName + '": ' + bad.join(' | '));
   }
 }
 
+/**
+ * QUE HACE: manda un correo de aviso a CONFIG.notifyEmail.
+ * DETALLE: si el correo fallara (por ejemplo, sin permiso), el error se apunta
+ *          en el registro pero no se relanza, para no tapar el error original.
+ */
 function notify_(subject, body) {
   try {
     MailApp.sendEmail(CONFIG.notifyEmail, '[Historico] ' + subject, body);
