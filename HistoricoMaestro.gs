@@ -108,7 +108,13 @@
  *   2. Ejecuta listarPestanas(): te dice como se llaman las pestanas de tus
  *      ficheros y te escribe el bloque listo para pegar en CONFIG.entities.
  *   3. Ejecuta dryRun() y revisa el registro.
- *   4. Pon un periodo en MANUAL_PERIOD y ejecuta ingestManual().
+ *   4. Primera carga. Elige segun cuantos ficheros tengas:
+ *        - ANOS de ficheros y solo quieres la ventana -> cargarUltimos()
+ *          (carga los ultimos CONFIG.windowPeriods y nada mas)
+ *        - pocos ficheros, quieres todos -> ingestScheduled()
+ *        - un periodo concreto -> MANUAL_PERIOD + ingestManual()
+ *      NO uses rebuildAll() con anos de ficheros: supera los 6 minutos y ademas
+ *      la retencion borraria casi todo lo cargado.
  *   5. Ejecuta installTrigger() para dejarlo automatico.
  *   6. Comparte el maestro SOLO EN LECTURA. Nadie debe editar ni formatear ese
  *      fichero: aplicar formato a columnas enteras lo devuelve al problema de
@@ -249,6 +255,9 @@ var SHEETS_MIME = 'application/vnd.google-apps.spreadsheet';
  * CUANDO SE EJECUTA: solo por el trigger automatico (o a mano, si quieres
  *           simular lo que hara el trigger).
  * NO HACE: no rehace periodos ya cargados. Para eso esta rebuildAll().
+ * OJO: la primera vez, si la carpeta tiene anos de ficheros, carga TODOS los que
+ *           falten y puede pasarse de los 6 minutos. Para la primera carga usa
+ *           cargarUltimos(), que solo trae la ventana.
  */
 function ingestScheduled() {
   // execute_ es el envoltorio que pone el candado y manda correo si algo falla.
@@ -471,6 +480,40 @@ function diagnosticoPestana() {
 }
 
 /**
+ * QUE HACE: carga en el maestro solo los ultimos N periodos que hay en la
+ *          carpeta, del mas antiguo al mas reciente.
+ * CUANDO SE EJECUTA: la primera vez, cuando la carpeta tiene anos de ficheros y
+ *          solo quieres la ventana. Con 150 ficheros semanales, cargarlos todos
+ *          para que la retencion borre 138 es tiempo tirado, y ademas se supera
+ *          el limite de 6 minutos por ejecucion.
+ * RECIBE: n. Si lo llamas sin argumento, usa CONFIG.windowPeriods (12).
+ * EJEMPLO: cargarUltimos() carga 12 semanas; cargarUltimos(26), medio ano.
+ */
+function cargarUltimos(n) {
+  // Sin argumento se usa la ventana configurada. Con argumento, se respeta:
+  // cargarUltimos(0) es un error, no "usa la ventana".
+  var cuantos = (n === undefined || n === null || n === '') ? CONFIG.windowPeriods : Number(n);
+  if (!(cuantos >= 1)) {
+    throw new Error('cargarUltimos necesita un numero de periodos mayor que 0.');
+  }
+
+  return execute_(function () {
+    var folder = DriveApp.getFolderById(CONFIG.sourceFolderId);
+    var files = listSourceFiles_(folder);
+    if (!files.length) {
+      throw new Error('No hay ficheros de periodo en la carpeta. Patron usado: ' + pattern_());
+    }
+
+    // files ya viene ordenado de mas antiguo a mas reciente.
+    var ultimos = files.slice(Math.max(files.length - cuantos, 0)).map(function (f) {
+      return f.periodo;
+    });
+    Logger.log('Se van a cargar ' + ultimos.length + ' periodos: ' + ultimos.join(', '));
+    return ingest_({ onlyMissing: true, onlyPeriods: ultimos });
+  });
+}
+
+/**
  * QUE HACE: diagnostico de solo lectura. No escribe nada en ningun sitio: solo
  *           mira la carpeta y el maestro, y escribe un resumen en el registro.
  * CUANDO SE EJECUTA: siempre lo PRIMERO, antes de instalar el trigger. Sirve
@@ -684,6 +727,14 @@ function ingest_(opts) {
     files = allFiles.filter(function (f) { return f.periodo === opts.onlyPeriod; });
     if (!files.length) {
       throw new Error('No hay ningun fichero para el periodo ' + opts.onlyPeriod + '. Revisa el nombre del fichero y CONFIG.filenamePattern.');
+    }
+  }
+
+  // Si se pide una lista de periodos (lo usa cargarUltimos), solo esos.
+  if (opts.onlyPeriods) {
+    files = allFiles.filter(function (f) { return opts.onlyPeriods.indexOf(f.periodo) !== -1; });
+    if (!files.length) {
+      throw new Error('Ningun fichero encaja con los periodos pedidos: ' + opts.onlyPeriods.join(', '));
     }
   }
 
