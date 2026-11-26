@@ -113,7 +113,7 @@
  *   - El scope de Drive es de solo lectura: el script nunca modifica ni borra
  *     nada fuera del fichero maestro.
  *   - Reconstruir muchos periodos de golpe puede superar los 6 minutos de
- *     ejecucion: hazlo por tandas con ingestPeriod('AAAA-Wnn').
+ *     ejecucion: hazlo por tandas con ingestPeriod('Y26W48').
  *   - Los numeros con formato local ("1.234,56") viajan como texto. Si Looker
  *     los necesita como numero, arreglalo en el origen.
  *   - Este fichero esta escrito sin tildes ni enes a proposito, para que no haya
@@ -147,15 +147,20 @@ var CONFIG = {
   // se borran automaticamente. 12 semanas son unos 3 meses de historico.
   windowPeriods: 12,
 
-  // Como se llaman los periodos:
-  //   'ISO_WEEK' -> 2026-W47  (semanal; la semana ISO empieza en lunes)
-  //   'MONTH'    -> 2026-11   (mensual)
+  // Que tipo de periodo maneja este script:
+  //   'ISO_WEEK' -> semanal, nombres tipo Y26W48 (semana ISO, empieza en lunes)
+  //   'MONTH'    -> mensual, nombres tipo Y26M11
+  // La letra W o M va en el propio nombre del fichero; este ajuste sirve para
+  // saber que letra esperar y para poner el trigger semanal o mensual.
   periodFormat: 'ISO_WEEK',
 
   // Patron del nombre de fichero. Si lo dejas vacio se deduce solo de
   // periodFormat. Solo lo cambias si tus ficheros se llaman de otra forma.
-  // Ejemplos: '^(\\d{4})-W(\\d{2})$'  o  '^(\\d{4})-(\\d{2})$'
+  // Ejemplos para el formato Y26W48 / Y26M11:
+  //   '^Y(\\d{2})W(\\d{1,2})$'   (semanal)
+  //   '^Y(\\d{2})M(\\d{1,2})$'   (mensual)
   // Los dobles backslash son obligatorios: es la forma de escribir \d en texto.
+  // \\d{1,2} acepta tanto Y26W5 como Y26W05.
   filenamePattern: '',
 
   // Fila donde empiezan las cabeceras en las pestanas de origen. Casi siempre 1.
@@ -181,8 +186,8 @@ var CONFIG = {
 };
 
 // Periodo que usa ingestManual() cuando lo pulsas a mano. Cambialo aqui y pulsa
-// Ejecutar. El formato tiene que coincidir con periodFormat: 2026-W47 o 2026-11.
-var MANUAL_PERIOD = '2026-W47';
+// Ejecutar. El formato tiene que coincidir con periodFormat: Y26W48 o Y26M11.
+var MANUAL_PERIOD = 'Y26W48';
 
 // ============================================================================
 // CONSTANTES INTERNAS  -  no hace falta tocarlas
@@ -232,7 +237,7 @@ function ingestScheduled() {
  * CUANDO SE EJECUTA: la primera vez que montas el maestro, o si sospechas que
  *           hay periodos mal cargados.
  * OJO: con muchos periodos puede superar el limite de 6 minutos por ejecucion.
- *      En ese caso, hazlo por tandas con ingestPeriod('2026-W40') y siguientes.
+ *      En ese caso, hazlo por tandas con ingestPeriod('Y26W40') y siguientes.
  */
 function rebuildAll() {
   execute_(function () {
@@ -252,7 +257,7 @@ function ingestManual() {
 /**
  * QUE HACE: rehace el periodo que le pases entre comillas como argumento.
  * CUANDO SE EJECUTA: desde el editor, cambiando MANUAL_PERIOD, o desde otro
- *           script llamandolo como ingestPeriod('2026-W47').
+ *           script llamandolo como ingestPeriod('Y26W48').
  */
 function ingestPeriod(periodo) {
   execute_(function () {
@@ -283,6 +288,25 @@ function dryRun() {
   files.forEach(function (f) {
     lines.push('  - ' + f.name + '  ->  ' + f.periodo + '  (fecha_reporte ' + formatDate_(fechaReporte_(f.periodo)) + ')');
   });
+
+  // Aviso util: ficheros con pinta de periodo pero del otro tipo (por ejemplo
+  // un mensual Y26M11 en un script semanal). Al cargar se ignoran en silencio,
+  // asi que aqui se delatan para que no parezca que el script no los ve.
+  var letraEsperada = (CONFIG.periodFormat === 'MONTH') ? 'M' : 'W';
+  var parecePeriodo = /^Y\d{2}([WM])\d{1,2}$/;
+  var descartados = [];
+  var it2 = folder.getFiles();
+  while (it2.hasNext()) {
+    var otro = it2.next();
+    var otroBase = otro.getName().replace(/\.[A-Za-z0-9]+$/, '');
+    var coincidencia = otroBase.match(parecePeriodo);
+    if (coincidencia && coincidencia[1] !== letraEsperada) {
+      descartados.push(otro.getName() + ' (tipo ' + coincidencia[1] + ', se esperaba ' + letraEsperada + ')');
+    }
+  }
+  if (descartados.length) {
+    lines.push('OJO, ignorados con pinta de periodo: ' + descartados.join(' | '));
+  }
 
   lines.push('');
   lines.push('Estado del maestro:');
@@ -427,7 +451,7 @@ function ingest_(opts) {
   }
 
   // Cache de periodos ya presentes por entidad, para no leer la columna N veces.
-  // periodCache['entidad_a']['2026-W47'] = true significa "ese periodo ya esta".
+  // periodCache['entidad_a']['Y26W47'] = true significa "ese periodo ya esta".
   var periodCache = {};
   CONFIG.entities.forEach(function (e) {
     periodCache[e.destino] = {};
@@ -731,15 +755,26 @@ function deletePeriodRows_(sheet, periodo) {
 /**
  * QUE HACE: retencion. Se queda con los CONFIG.windowPeriods periodos mas
  *          recientes y borra las filas de todos los demas.
- * DETALLE: sort() ordena los periodos como texto; funciona porque van con ceros
- *          a la izquierda (2026-W07 < 2026-W47) y el mismo formato siempre.
+ * DETALLE: el orden se calcula con ordenDe_ (numero), nunca comparando el texto
+ *          del periodo: "Y26W5" ordenaria detras de "Y26W48" como texto.
  */
 function applyRetention_(master, entity) {
   var sheet = master.getSheetByName(entity.destino);
   if (!sheet || sheet.getLastRow() < 2) return;
 
   var periods = readPeriodColumn_(sheet);
-  var ordered = distinct_(periods).sort();
+  if (!periods.length) return;
+
+  // Una pestana no puede mezclar semanas (W) y meses (M): sus claves numericas
+  // se solaparian (Y26W11 y Y26M11 darian el mismo numero) y se borraria mal.
+  var letras = distinct_(periods.map(function (p) { return String(p).charAt(3); }));
+  if (letras.length > 1) {
+    throw new Error('la pestana "' + sheet.getName() + '" mezcla periodos semanales (W) y mensuales (M). ' +
+      'Cada pestana debe contener un solo tipo de periodo.');
+  }
+
+  var ordered = distinct_(periods);
+  ordered.sort(function (a, b) { return ordenDe_(a) - ordenDe_(b); });
 
   // Si aun no hay mas periodos que la ventana, no hay nada que borrar.
   if (ordered.length <= CONFIG.windowPeriods) return;
@@ -796,15 +831,18 @@ function deleteRowsGrouped_(sheet, rows) {
 /**
  * QUE HACE: recorre la carpeta y devuelve solo los ficheros cuyo nombre encaja
  *          con el patron, con su periodo ya deducido.
- * DEVUELVE: lista de objetos {id, name, periodo, anio, semana, fechaReporte},
- *          ordenada del periodo mas antiguo al mas reciente.
+ * DEVUELVE: lista de objetos {id, name, periodo, anio, semana, orden,
+ *          fechaReporte}, ordenada del periodo mas antiguo al mas reciente.
  * DETALLE: la extension se quita antes de comparar, asi que funciona igual con
- *          "2026-W47" que con "2026-W47.xlsx" o "2026-W47 copia".
+ *          "Y26W48" que con "Y26W48.xlsx" o "Y26W48 copia".
  */
 function listSourceFiles_(folder) {
   var re = new RegExp(pattern_());
   var it = folder.getFiles();
   var out = [];
+
+  // Sirve para detectar el mismo periodo escrito de dos formas (Y26W5 / Y26W05).
+  var porOrden = {};
 
   // getFiles() devuelve un "iterador": se recorre con hasNext() y next().
   while (it.hasNext()) {
@@ -817,10 +855,28 @@ function listSourceFiles_(folder) {
     // Si el nombre no encaja con el patron, se ignora sin avisar.
     if (!m) continue;
 
-    // m[1] es el ano y m[2] el numero de semana o de mes, segun el patron.
-    var year = Number(m[1]);
+    // m[1] son las dos cifras del ano (26) y m[2] el numero de semana o de mes.
+    var anoCorto = m[1];
     var num = Number(m[2]);
-    var periodo = (CONFIG.periodFormat === 'MONTH') ? (m[1] + '-' + pad_(num)) : (m[1] + '-W' + pad_(num));
+
+    // El periodo se guarda TAL CUAL se escribio en el nombre: Y26W5 se queda
+    // como Y26W5, no se rellena a Y26W05. Asi el maestro usa tu nomenclatura.
+    var periodo = 'Y' + anoCorto + (CONFIG.periodFormat === 'MONTH' ? 'M' : 'W') + m[2];
+
+    // Ano completo: Y26 se interpreta como 2026.
+    var year = 2000 + Number(anoCorto);
+
+    // Clave numerica para ordenar y para la retencion. No se puede ordenar el
+    // texto tal cual: por orden alfabetico "Y26W5" iria DESPUES de "Y26W48".
+    var orden = year * 100 + num;
+
+    // Dos ficheros con la misma clave son el mismo periodo escrito de dos
+    // formas distintas: eso descuadraria la retencion, asi que se para aqui.
+    if (porOrden[orden] && porOrden[orden] !== periodo) {
+      throw new Error('dos ficheros representan el mismo periodo: "' + porOrden[orden] + '" y "' +
+        periodo + '". Deja solo uno y unifica el formato.');
+    }
+    porOrden[orden] = periodo;
 
     out.push({
       id: file.getId(),
@@ -828,12 +884,13 @@ function listSourceFiles_(folder) {
       periodo: periodo,
       anio: year,
       semana: (CONFIG.periodFormat === 'MONTH') ? '' : num,
+      orden: orden,
       fechaReporte: fechaReporte_(periodo)
     });
   }
 
-  // Orden alfabetico del periodo, que con este formato equivale al cronologico.
-  out.sort(function (a, b) { return a.periodo < b.periodo ? -1 : (a.periodo > b.periodo ? 1 : 0); });
+  // Orden por la clave numerica, que si es cronologico de verdad.
+  out.sort(function (a, b) { return a.orden - b.orden; });
   return out;
 }
 
@@ -841,10 +898,12 @@ function listSourceFiles_(folder) {
  * QUE HACE: devuelve el patron (expresion regular) que deben cumplir los
  *          nombres de fichero. Si CONFIG.filenamePattern esta relleno, se usa
  *          tal cual; si no, se deduce de periodFormat.
+ * EJEMPLO SEMANAL: Y26W48 -> Y = ano, 26 = 2026, W = semana, 48 = semana 48.
+ * DETALLE: \\d{1,2} acepta una o dos cifras, para que Y26W5 y Y26W05 valgan.
  */
 function pattern_() {
   if (CONFIG.filenamePattern) return CONFIG.filenamePattern;
-  return (CONFIG.periodFormat === 'MONTH') ? '^(\\d{4})-(\\d{2})$' : '^(\\d{4})-W(\\d{2})$';
+  return (CONFIG.periodFormat === 'MONTH') ? '^Y(\\d{2})M(\\d{1,2})$' : '^Y(\\d{2})W(\\d{1,2})$';
 }
 
 /**
@@ -899,26 +958,49 @@ function isoWeekToMonday_(year, week) {
 }
 
 /**
- * QUE HACE: convierte un periodo ("2026-W47" o "2026-11") en su fecha de
+ * QUE HACE: convierte un periodo ("Y26W47" o "Y26M11") en su fecha de
  *          referencia, que es la que se archiva en la columna fecha_reporte.
  *          Semanal -> el lunes de esa semana. Mensual -> el dia 1 del mes.
  * PARA QUE: Looker Studio necesita una fecha de verdad para ordenar y para los
- *          filtros de "ultimas N semanas/meses".
+ *          filtros de "ultimas N semanas/meses". La columna periodo es texto y
+ *          no sirve para eso.
  */
 function fechaReporte_(periodo) {
   if (CONFIG.periodFormat === 'MONTH') {
-    var pm = periodo.split('-');
-    return new Date(Date.UTC(Number(pm[0]), Number(pm[1]) - 1, 1, 12, 0, 0));
+    var pm = String(periodo).match(/^Y(\d{2})M(\d{1,2})$/);
+    if (!pm) {
+      throw new Error('periodo mensual con formato inesperado: ' + periodo + ' (se esperaba algo como Y26M11)');
+    }
+    var mes = Number(pm[2]);
+    if (!(mes >= 1 && mes <= 12)) {
+      throw new Error('mes fuera de rango en el periodo: ' + periodo);
+    }
+    return new Date(Date.UTC(2000 + Number(pm[1]), mes - 1, 1, 12, 0, 0));
   }
 
-  var pw = periodo.split('-W');
-  var week = Number(pw[1]);
+  var pw = String(periodo).match(/^Y(\d{2})W(\d{1,2})$/);
+  if (!pw) {
+    throw new Error('periodo semanal con formato inesperado: ' + periodo + ' (se esperaba algo como Y26W48)');
+  }
+  var week = Number(pw[2]);
 
   // Una semana ISO solo puede ir de 1 a 53; fuera de eso, el fichero esta mal.
   if (!(week >= 1 && week <= 53)) {
     throw new Error('semana ISO fuera de rango: ' + periodo);
   }
-  return isoWeekToMonday_(Number(pw[0]), week);
+  return isoWeekToMonday_(2000 + Number(pw[1]), week);
+}
+
+/**
+ * QUE HACE: convierte un periodo en un numero comparable (Y26W48 -> 202648) y
+ *          devuelve -1 si el texto no tiene el formato esperado.
+ * PARA QUE: hace falta para ordenar. Comparando texto, "Y26W5" quedaria por
+ *          detras de "Y26W48" porque el caracter "5" va despues del "4".
+ */
+function ordenDe_(periodo) {
+  var m = String(periodo).match(/^Y(\d{2})[WM](\d{1,2})$/);
+  if (!m) return -1;
+  return (2000 + Number(m[1])) * 100 + Number(m[2]);
 }
 
 /**
@@ -946,15 +1028,6 @@ function normalize_(s) {
     .replace(/\s+/g, ' ')
     .trim()
     .toLowerCase();
-}
-
-/**
- * QUE HACE: completa con un cero a la izquierda los numeros de una cifra.
- * PARA QUE: "9" se convierta en "09" y los periodos ordenen bien como texto
- *          (2026-W09 va antes que 2026-W10).
- */
-function pad_(n) {
-  return (n < 10 ? '0' : '') + n;
 }
 
 /**
