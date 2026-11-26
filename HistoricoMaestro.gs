@@ -97,11 +97,13 @@
  * ----------------------------------------------------------------------------
  * PUESTA EN MARCHA (en este orden)
  * ----------------------------------------------------------------------------
- *   1. Rellena CONFIG (IDs, correo y entidades).
- *   2. Ejecuta dryRun() y revisa el registro: ficheros detectados y estado.
- *   3. Pon un periodo en MANUAL_PERIOD y ejecuta ingestManual().
- *   4. Ejecuta installTrigger() para dejarlo automatico.
- *   5. Comparte el maestro SOLO EN LECTURA. Nadie debe editar ni formatear ese
+ *   1. Rellena los IDs y el correo en CONFIG.
+ *   2. Ejecuta listarPestanas(): te dice como se llaman las pestanas de tus
+ *      ficheros y te escribe el bloque listo para pegar en CONFIG.entities.
+ *   3. Ejecuta dryRun() y revisa el registro.
+ *   4. Pon un periodo en MANUAL_PERIOD y ejecuta ingestManual().
+ *   5. Ejecuta installTrigger() para dejarlo automatico.
+ *   6. Comparte el maestro SOLO EN LECTURA. Nadie debe editar ni formatear ese
  *      fichero: aplicar formato a columnas enteras lo devuelve al problema de
  *      memoria del navegador.
  *
@@ -173,18 +175,24 @@ var CONFIG = {
   // (#REF!, #N/A, #DIV/0!...). Mejor dejarlo en true: no quieres archivar basura.
   failOnErrorCells: true,
 
-  // Una entrada por cada pestana de datos que quieras archivar.
-  // Cada entrada es un objeto con tres campos posibles:
-  //   destino  : nombre de la pestana en el maestro. Si no existe, se crea.
-  //              Es el nombre que veras luego en Looker Studio.
-  //   origen   : nombre de la pestana dentro del fichero de periodo.
+  // ESTA ES LA LISTA DE PESTANAS QUE SE HISTORIZAN. Una linea por pestana.
+  // Si aqui no esta, no se copia. Las tablas, resumenes y portadas del fichero
+  // se quedan fuera simplemente no poniendolas.
+  //
+  //   origen   : nombre de la pestana DENTRO del fichero de periodo. Tiene que
+  //              ser el nombre real; si no lo sabes, ejecuta listarPestanas() y
+  //              copia lo que te escriba en el registro.
+  //   destino  : nombre de la pestana en el maestro (el que veras en Looker).
+  //              Puede ser distinto del origen; si no existe, se crea.
   //   headerRow: opcional. Solo si esa pestana tiene las cabeceras en otra fila
   //              distinta de CONFIG.headerRow.
-  // Puedes tener tantas entradas como necesites; con dejar las que uses basta.
+  //
+  // El valor de abajo es un ejemplo que HAY QUE SUSTITUIR por las pestanas
+  // reales. Si lo dejas tal cual, la ejecucion fallara diciendo que no encuentra
+  // esa pestana, que es justo lo que queremos: mejor fallar claro que copiar
+  // datos de un sitio que no toca.
   entities: [
-    { destino: 'entidad_a', origen: 'Hoja 1' },
-    { destino: 'entidad_b', origen: 'Hoja 2' },
-    { destino: 'entidad_c', origen: 'Hoja 3' }
+    { destino: 'ventas', origen: 'PON_AQUI_EL_NOMBRE_DE_LA_PESTANA' }
   ]
 };
 
@@ -263,9 +271,73 @@ function ingestManual() {
  *           script llamandolo como ingestPeriod('Y26W48').
  */
 function ingestPeriod(periodo) {
+  // Si se pulsa desde el editor sin argumento, el valor llega vacio. Mejor un
+  // mensaje util que un error raro buscando un periodo llamado "undefined".
+  if (!periodo || typeof periodo !== 'string') {
+    throw new Error('ingestPeriod necesita un periodo, por ejemplo ingestPeriod("Y26W48"). ' +
+      'Para lanzarlo a mano desde el editor usa ingestManual() y edita MANUAL_PERIOD.');
+  }
   execute_(function () {
     return ingest_({ onlyMissing: false, onlyPeriod: String(periodo) });
   });
+}
+
+/**
+ * QUE HACE: te dice como se llaman las pestanas que tiene el fichero de periodo
+ *          MAS RECIENTE de la carpeta, cuantas filas y columnas trae cada una,
+ *          y si ya esta configurada en CONFIG.entities. Ademas escribe el
+ *          bloque listo para pegar en CONFIG.entities.
+ * CUANDO SE EJECUTA: antes de rellenar CONFIG.entities, para no adivinar
+ *          nombres. No escribe nada en ningun sitio.
+ * RESULTADO: Ver > Registro de ejecuciones (o Ctrl+Enter).
+ */
+function listarPestanas() {
+  var folder = DriveApp.getFolderById(CONFIG.sourceFolderId);
+  var files = listSourceFiles_(folder);
+  if (!files.length) {
+    throw new Error('No hay ficheros de periodo en la carpeta. Patron usado: ' + pattern_());
+  }
+
+  // El ultimo de la lista es el periodo mas reciente: el que mejor representa
+  // como son los ficheros hoy.
+  var ultimo = files[files.length - 1];
+  var ss = openSource_(ultimo.id);
+  var lines = [];
+
+  lines.push('Fichero mas reciente: ' + ultimo.name + '  (periodo ' + ultimo.periodo + ')');
+  lines.push('Pestanas que tiene:');
+
+  // Mapa de pestanas ya configuradas, en forma normalizada para comparar igual
+  // que el resto del script (sin tildes, sin espacios de mas, en minusculas).
+  var configuradas = {};
+  CONFIG.entities.forEach(function (e) {
+    configuradas[normalize_(e.origen)] = e.destino;
+  });
+
+  var candidatas = [];
+  ss.getSheets().forEach(function (s) {
+    var filas = Math.max(s.getLastRow() - 1, 0);
+    var cols = s.getLastColumn();
+    var destino = configuradas[normalize_(s.getName())];
+    var marca = destino ? ('  -> se guarda en "' + destino + '"') : '  -> NO configurada';
+    lines.push('  - "' + s.getName() + '": ' + filas + ' filas de datos, ' + cols + ' columnas' + marca);
+
+    // Solo se proponen las que tienen datos: las vacias no aportan nada.
+    if (filas > 0) {
+      candidatas.push('    { destino: "' + s.getName() + '", origen: "' + s.getName() + '" }');
+    }
+  });
+
+  lines.push('');
+  lines.push('Para historizar alguna, pega este bloque dentro de CONFIG.entities');
+  lines.push('y borra las lineas de las pestanas que no quieras:');
+  lines.push('  entities: [');
+  lines.push(candidatas.join(',\n'));
+  lines.push('  ]');
+
+  var out = lines.join('\n');
+  Logger.log(out);
+  return out;
 }
 
 /**
@@ -344,6 +416,23 @@ function dryRun() {
       lines.push('  "' + e.destino + '" (origen "' + e.origen + '"): PROBLEMA -> ' + err.message);
     }
   });
+
+  // Comprobacion de que las pestanas configuradas existen de verdad en el
+  // fichero mas reciente: asi se descubre aqui y no a mitad de la carga.
+  if (files.length) {
+    var ultimoFichero = files[files.length - 1];
+    var fuente = openSource_(ultimoFichero.id);
+    lines.push('');
+    lines.push('Pestanas configuradas, comprobadas en "' + ultimoFichero.name + '":');
+    CONFIG.entities.forEach(function (e) {
+      try {
+        var nombreReal = resolveSheetName_(fuente, e.origen);
+        lines.push('  OK  "' + nombreReal + '"  ->  se guarda en "' + e.destino + '"');
+      } catch (err) {
+        lines.push('  FALTA  "' + e.origen + '"  ->  ' + err.message);
+      }
+    });
+  }
 
   // join('\n') pega todas las lineas separandolas con un salto de linea.
   var out = lines.join('\n');
