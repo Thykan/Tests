@@ -111,11 +111,12 @@
  *   4. Primera carga. Elige segun cuantos ficheros tengas:
  *        - ANOS de ficheros y solo quieres la ventana -> cargarUltimos()
  *          (carga los ultimos CONFIG.windowPeriods y nada mas)
- *        - pocos ficheros, quieres todos -> ingestScheduled()
+ *        - pocos ficheros, quieres todos -> cargarNuevos()
  *        - un periodo concreto -> MANUAL_PERIOD + ingestManual()
  *      NO uses rebuildAll() con anos de ficheros: supera los 6 minutos y ademas
  *      la retencion borraria casi todo lo cargado.
- *   5. Ejecuta installTrigger() para dejarlo automatico.
+ *   5. Uso normal, SIN trigger: guarda el fichero de la semana o del mes y
+ *      ejecuta cargarNuevos(). Eso es todo, cada vez.
  *   6. Comparte el maestro SOLO EN LECTURA. Nadie debe editar ni formatear ese
  *      fichero: aplicar formato a columnas enteras lo devuelve al problema de
  *      memoria del navegador.
@@ -249,17 +250,19 @@ var SHEETS_MIME = 'application/vnd.google-apps.spreadsheet';
 // boton Ejecutar) o que puede lanzar un trigger automatico.
 
 /**
- * QUE HACE: ejecucion automatica del dia a dia. Recorre la carpeta y carga en el
- *           maestro solo los periodos que todavia no estan dentro. Si un periodo
- *           ya esta, lo salta. Es lo que lanza el trigger semanal o mensual.
- * CUANDO SE EJECUTA: solo por el trigger automatico (o a mano, si quieres
- *           simular lo que hara el trigger).
- * NO HACE: no rehace periodos ya cargados. Para eso esta rebuildAll().
+ * QUE HACE: EL BOTON DEL DIA A DIA. Recorre la carpeta y sus subcarpetas y carga
+ *           en el maestro solo los periodos que todavia no estan dentro. Si un
+ *           periodo ya esta, lo salta sin abrir siquiera el fichero.
+ * CUANDO SE EJECUTA: a mano, justo despues de guardar el fichero de la semana o
+ *           del mes. Tambien es lo que lanzaria el trigger automatico si algun
+ *           dia lo instalas, pero no hace falta: pensado para lanzarlo tu.
+ * NO HACE: no rehace periodos ya cargados. Para corregir uno ya cargado esta
+ *           MANUAL_PERIOD + ingestManual().
  * OJO: la primera vez, si la carpeta tiene anos de ficheros, carga TODOS los que
- *           falten y puede pasarse de los 6 minutos. Para la primera carga usa
- *           cargarUltimos(), que solo trae la ventana.
+ *           falten y puede pasarse de los 6 minutos. Solo para esa primera vez
+ *           usa cargarUltimos(), que trae unicamente la ventana.
  */
-function ingestScheduled() {
+function cargarNuevos() {
   // execute_ es el envoltorio que pone el candado y manda correo si algo falla.
   // Le pasamos una funcion anonima: el trabajo real que debe ejecutar.
   execute_(function () {
@@ -268,12 +271,13 @@ function ingestScheduled() {
 }
 
 /**
- * QUE HACE: carga inicial o reconstruccion completa. Vuelve a procesar todos los
- *           ficheros de la carpeta, reescribiendo cada periodo que encuentre.
- * CUANDO SE EJECUTA: la primera vez que montas el maestro, o si sospechas que
- *           hay periodos mal cargados.
- * OJO: con muchos periodos puede superar el limite de 6 minutos por ejecucion.
- *      En ese caso, hazlo por tandas con ingestPeriod('Y26W40') y siguientes.
+ * QUE HACE: reconstruccion completa. Vuelve a procesar TODOS los ficheros de la
+ *           carpeta, reescribiendo cada periodo que encuentre.
+ * CUANDO SE EJECUTA: solo si sospechas que hay periodos mal cargados y quieres
+ *           rehacerlos desde los ficheros. NO es la primera carga.
+ * OJO: con muchos periodos supera el limite de 6 minutos por ejecucion. Con
+ *      anos de ficheros usa cargarUltimos() para la primera carga, o hazlo por
+ *      tandas con ingestPeriod('Y26W40') y siguientes.
  */
 function rebuildAll() {
   execute_(function () {
@@ -514,6 +518,71 @@ function cargarUltimos(n) {
 }
 
 /**
+ * QUE HACE: radiografia de las columnas del maestro. Para cada pestana dice
+ *          cuantas celdas con valor tiene cada columna, y avisa cuando dos
+ *          columnas parecen la misma cosa partida en dos.
+ * CUANDO SE EJECUTA: cuando sospechas que un renombrado en el origen dejo datos
+ *          repartidos entre la columna vieja y la nueva. Es la forma de verlo.
+ * COMO SE LEE: si "importe" tiene 26.000 valores y "importe_total" otros 26.000,
+ *          y el total de filas es 52.000, es un renombrado: la mitad de los
+ *          periodos estan en una columna y la otra mitad en la otra.
+ * RESULTADO: Ver > Registro de ejecuciones.
+ */
+function diagnosticoColumnas() {
+  var master = SpreadsheetApp.openById(CONFIG.masterFileId);
+  var lines = ['Columnas del maestro y celdas con valor en cada una:'];
+
+  CONFIG.entities.forEach(function (e) {
+    lines.push('');
+    var sh = master.getSheetByName(e.destino);
+    if (!sh) {
+      lines.push('=== "' + e.destino + '": la pestana no existe');
+      return;
+    }
+
+    var lastRow = sh.getLastRow();
+    var lastCol = sh.getLastColumn();
+    lines.push('=== "' + e.destino + '": ' + Math.max(lastRow - 1, 0) + ' filas x ' + lastCol + ' columnas');
+    if (lastRow < 2 || lastCol === 0) return;
+
+    var vals = sh.getRange(1, 1, lastRow, lastCol).getValues();
+    var header = vals.shift().map(function (v) { return String(v).trim(); });
+
+    var conteo = [];
+    for (var c = 0; c < lastCol; c++) conteo.push(0);
+    vals.forEach(function (row) {
+      for (var j = 0; j < lastCol; j++) {
+        if (row[j] !== '' && row[j] !== null) conteo[j]++;
+      }
+    });
+
+    header.forEach(function (h, i) {
+      lines.push('  ' + (i + 1) + '. ' + (h || '(sin nombre)') + ': ' + conteo[i] + ' celdas con valor');
+    });
+
+    // Heuristica de renombrado: dos columnas de datos cuyos recuentos suman
+    // aproximadamente el total de filas. Si ambas estuvieran completas sumarian
+    // el doble, asi que esa suma solo cuadra cuando cada una tiene la mitad.
+    var total = vals.length;
+    if (total < 2) return;
+
+    for (var a = META_HEADERS.length; a < lastCol - 1; a++) {
+      for (var b = a + 1; b < lastCol - 1; b++) {
+        var suma = conteo[a] + conteo[b];
+        if (conteo[a] > 0 && conteo[b] > 0 && Math.abs(suma - total) <= Math.max(2, total * 0.02)) {
+          lines.push('  OJO: "' + header[a] + '" y "' + header[b] + '" suman ' + suma + ' de ' + total +
+            ' filas. Huele a renombrado: los datos estan partidos entre las dos.');
+        }
+      }
+    }
+  });
+
+  var out = lines.join('\n');
+  Logger.log(out);
+  return out;
+}
+
+/**
  * QUE HACE: diagnostico de solo lectura. No escribe nada en ningun sitio: solo
  *           mira la carpeta y el maestro, y escribe un resumen en el registro.
  * CUANDO SE EJECUTA: siempre lo PRIMERO, antes de instalar el trigger. Sirve
@@ -613,8 +682,10 @@ function dryRun() {
 }
 
 /**
- * QUE HACE: deja programada la ejecucion automatica (el "trigger").
- * CUANDO SE EJECUTA: una sola vez, cuando ya has probado dryRun e ingestManual.
+ * OPCIONAL. QUE HACE: deja programada la ejecucion automatica (el "trigger").
+ * SI lanzas el script a mano, NO ejecutes esto: no hace falta y ademas puede
+ *          adelantarse a que los datos esten cerrados.
+ * CUANDO SE EJECUTA: una sola vez, si algun dia quieres que se cargue solo.
  * DETALLE: lunes a las 06:00 si es semanal; dia 1 a las 06:00 si es mensual.
  *          Antes de crear uno nuevo borra el anterior, para no duplicar.
  */
@@ -623,7 +694,7 @@ function installTrigger() {
 
   // Se va montando el trigger por partes: primero "que funcion llamar" y con
   // que zona horaria; luego la frecuencia.
-  var builder = ScriptApp.newTrigger('ingestScheduled').timeBased().inTimezone(CONFIG.timezone);
+  var builder = ScriptApp.newTrigger('cargarNuevos').timeBased().inTimezone(CONFIG.timezone);
   if (CONFIG.periodFormat === 'MONTH') {
     builder.onMonthDay(1).atHour(6).create();
   } else {
@@ -635,13 +706,17 @@ function installTrigger() {
 
 /**
  * QUE HACE: borra el trigger automatico de este script, si existe.
- * CUANDO SE EJECUTA: si quieres parar la automatizacion sin borrar el proyecto.
+ * CUANDO SE EJECUTA: si quieres parar la automatizacion sin borrar el proyecto,
+ *          o para dejar limpio un trigger antiguo que ya no quieras.
  */
 function removeTriggers() {
   // getProjectTriggers() devuelve todos los triggers del proyecto. Solo se
-  // borran los que llaman a ingestScheduled: el resto se deja intacto.
+  // borran los de este script; el resto se deja intacto. Se mira tambien el
+  // nombre antiguo ("ingestScheduled") por si instalaste un trigger con una
+  // version anterior: si no, se quedaria ahi fallando cada semana.
+  var nombres = ['cargarNuevos', 'ingestScheduled'];
   ScriptApp.getProjectTriggers().forEach(function (t) {
-    if (t.getHandlerFunction() === 'ingestScheduled') {
+    if (nombres.indexOf(t.getHandlerFunction()) !== -1) {
       ScriptApp.deleteTrigger(t);
     }
   });
@@ -745,14 +820,13 @@ function ingest_(opts) {
     ensureMasterTab_(master, e);
   });
 
-  // Cache de periodos ya presentes por entidad, para no leer la columna N veces.
-  // periodCache['entidad_a']['Y26W47'] = true significa "ese periodo ya esta".
-  var periodCache = {};
+  // Estado de cada pestana destino: que periodos tiene, en que filas, y cual es
+  // la ultima fila de datos. Se lee UNA vez al principio y se va actualizando en
+  // memoria. Antes se releia la columna de periodo en cada fichero, y con 52
+  // semanas eso crece hasta hacerse cuadratico: por eso se agotaba el tiempo.
+  var estados = {};
   CONFIG.entities.forEach(function (e) {
-    periodCache[e.destino] = {};
-    readPeriodColumn_(master.getSheetByName(e.destino)).forEach(function (p) {
-      periodCache[e.destino][p] = true;
-    });
+    estados[e.destino] = crearEstadoEntidad_(master.getSheetByName(e.destino));
   });
 
   // Aqui se va apuntando lo que pasa, para el resumen final y el correo.
@@ -763,7 +837,7 @@ function ingest_(opts) {
     // De las entidades configuradas, cuales hay que cargar para este fichero.
     // Con onlyMissing, se descartan las que ya tienen ese periodo.
     var pending = CONFIG.entities.filter(function (e) {
-      return !(opts.onlyMissing && periodCache[e.destino][entry.periodo]);
+      return !(opts.onlyMissing && estados[e.destino].filas[entry.periodo]);
     });
 
     if (!pending.length) {
@@ -785,8 +859,8 @@ function ingest_(opts) {
     // Un fallo en una entidad tampoco debe impedir cargar las otras.
     pending.forEach(function (e) {
       try {
-        ingestEntity_(master, srcSs, e, entry, entry.periodo === latestPeriod, summary.warned);
-        periodCache[e.destino][entry.periodo] = true;
+        estados[e.destino] = ingestEntity_(master, srcSs, e, entry, entry.periodo === latestPeriod,
+          summary.warned, estados[e.destino]);
         summary.ok.push(e.destino + ' @ ' + entry.periodo);
       } catch (err) {
         summary.failed.push(entry.periodo + ' / ' + e.destino + ': ' + err.message);
@@ -824,6 +898,31 @@ function ingest_(opts) {
 }
 
 /**
+ * QUE HACE: lee una vez la columna de periodo de una pestana del maestro y
+ *          devuelve un resumen en memoria: que periodos hay, en que filas y
+ *          cual es la ultima fila de datos.
+ * PARA QUE: asi el script NO tiene que releer la columna por cada fichero que
+ *          carga. Con 52 semanas esa relectura crecia hasta agotar el tiempo.
+ * DEVUELVE: { filas: { "Y26W48": [1201, 1202, ...] }, ultima: 1202 }
+ */
+function crearEstadoEntidad_(sheet) {
+  var estado = { filas: {}, ultima: 1 };
+  if (!sheet || sheet.getLastRow() < 2) return estado;
+
+  var col = periodoColumn_(sheet);
+  var vals = sheet.getRange(2, col, sheet.getLastRow() - 1, 1).getValues();
+
+  for (var i = 0; i < vals.length; i++) {
+    var p = String(vals[i][0]).trim();
+    if (!p) continue;
+    if (!estado.filas[p]) estado.filas[p] = [];
+    estado.filas[p].push(i + 2);
+    estado.ultima = i + 2;
+  }
+  return estado;
+}
+
+/**
  * QUE HACE: archiva una entidad de un fichero de periodo en su pestana del
  *           maestro. Es el corazon del script.
  * RECIBE:
@@ -834,10 +933,12 @@ function ingest_(opts) {
  *   isLatest  : true si este fichero es el mas reciente de la carpeta; solo
  *               entonces una columna ausente se trata como renombrado y aborta.
  *   warnings  : lista compartida donde se apuntan los avisos no criticos.
+ *   estado    : resumen en memoria de la pestana destino (ver crearEstadoEntidad_).
+ * DEVUELVE: el estado actualizado, para no volver a leer la columna.
  * PASOS: preparar pestana destino, leer origen, validar, alinear columnas,
  *        borrar el periodo si ya estaba y escribir de una sola vez.
  */
-function ingestEntity_(master, srcSs, entity, entry, isLatest, warnings) {
+function ingestEntity_(master, srcSs, entity, entry, isLatest, warnings, estado) {
   // 1. Pestana destino del maestro (se crea si no existe).
   var masterSheet = ensureMasterTab_(master, entity);
 
@@ -901,14 +1002,26 @@ function ingestEntity_(master, srcSs, entity, entry, isLatest, warnings) {
     });
   });
 
-  // Upsert: fuera las filas previas de este periodo, luego append de una sola
-  // escritura. La fila de destino se calcula por la ultima fila que tiene
-  // periodo, NO por getLastRow(): si la pestana trae formato aplicado muy abajo,
-  // getLastRow() devuelve miles de filas y el script escribiria al final del
-  // vacio, dejando un hueco enorme en medio.
-  deletePeriodRows_(masterSheet, entry.periodo);
-  var startRow = ultimaFilaDeDatos_(masterSheet) + 1;
+  // Upsert sin releer la hoja:
+  //  - si el periodo ya estaba, se borran sus filas y se recalcula el estado,
+  //    porque los indices de las filas de debajo cambian;
+  //  - si no estaba, se escribe al final de los datos, sin ninguna lectura.
+  // La fila de destino se calcula por la ultima fila con periodo, NO por
+  // getLastRow(): si la pestana trae formato aplicado muy abajo, getLastRow()
+  // devuelve miles de filas y el script escribiria al final del vacio.
+  if (estado.filas[entry.periodo]) {
+    deleteRowsGrouped_(masterSheet, estado.filas[entry.periodo]);
+    estado = crearEstadoEntidad_(masterSheet);
+  }
+
+  var startRow = estado.ultima + 1;
   escribirFilas_(masterSheet, startRow, payload, warnings, entity.destino, entry.periodo);
+
+  // El estado queda al dia para el siguiente fichero: cero lecturas extra.
+  estado.ultima = startRow + payload.length - 1;
+  estado.filas[entry.periodo] = [];
+  for (var r = startRow; r <= estado.ultima; r++) estado.filas[entry.periodo].push(r);
+  return estado;
 }
 
 // ============================================================================
@@ -1007,6 +1120,14 @@ function ensureColumns_(sheet, srcHeader, isLatest, warnings, destino, periodo) 
     sheet.insertColumnsAfter(lastDataPos, newCols.length);
     sheet.getRange(1, lastDataPos + 1, 1, newCols.length).setValues([newCols]);
     Logger.log('Columnas nuevas en "' + sheet.getName() + '": ' + newCols.join(', '));
+
+    // Se avisa en el resumen, no solo en el registro: una columna nueva en un
+    // fichero antiguo casi siempre es un renombrado hecho sin querer, y deja los
+    // datos partidos entre la columna vieja y la nueva.
+    if (warnings) {
+      warnings.push(destino + ' @ ' + periodo + ': columnas nuevas anadidas -> ' + newCols.join(', ') +
+        (isLatest ? '' : ' (ojo: viene de un fichero que NO es el mas reciente, puede ser un renombrado)'));
+    }
   }
   return readHeader_(sheet);
 }
@@ -1037,23 +1158,6 @@ function readPeriodColumn_(sheet) {
   return sheet.getRange(2, col, sheet.getLastRow() - 1, 1).getValues().map(function (r) {
     return String(r[0]);
   });
-}
-
-/**
- * QUE HACE: borra del maestro todas las filas de un periodo concreto.
- * PARA QUE: es la primera mitad del upsert; la segunda es volver a escribirlas.
- * DEVUELVE: cuantas filas se han borrado.
- * DETALLE: se suman 2 al indice porque la lista empieza en la fila 2 (la 1 es
- *          la cabecera y no se toca nunca).
- */
-function deletePeriodRows_(sheet, periodo) {
-  var periods = readPeriodColumn_(sheet);
-  var rows = [];
-  periods.forEach(function (p, i) {
-    if (p === periodo) rows.push(i + 2);
-  });
-  deleteRowsGrouped_(sheet, rows);
-  return rows.length;
 }
 
 /**
