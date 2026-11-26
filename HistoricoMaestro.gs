@@ -4,11 +4,12 @@
  * ============================================================================
  *
  * QUE HACE ESTE SCRIPT
- *   Coge los ficheros de periodo que ya se guardan en una carpeta de Drive (una
- *   hoja de Google por semana o por mes), les lee las pestanas de datos y va
- *   copiando las filas a un unico fichero "maestro" con ID fijo. Ese maestro es
- *   el que lee Looker Studio, y al tener siempre el mismo ID nunca se rompe la
- *   conexion. Los periodos viejos se van borrando para que el fichero no crezca.
+ *   Recorre una carpeta de Drive y TODAS sus subcarpetas (puedes tenerlas
+ *   ordenadas por ano: 2025/, 2026/...). Dentro encuentra una hoja de Google por
+ *   periodo, lee las pestanas de datos que le indiques y va copiando las filas a
+ *   un unico fichero "maestro" con ID fijo. Ese maestro es el que lee Looker
+ *   Studio, y al tener siempre el mismo ID nunca se rompe la conexion. Los
+ *   periodos viejos se van borrando para que el fichero no crezca.
  *
  *   Nunca se crea una pestana por periodo. Se crea UNA PESTANA POR ENTIDAD
  *   (una cosa que se mide), y todas las filas de todos los periodos se apilan
@@ -141,8 +142,9 @@ var CONFIG = {
   // /spreadsheets/d/ y /edit. Debe estar en Mi unidad, no en unidad compartida.
   masterFileId: 'PON_AQUI_EL_ID_DEL_MAESTRO',
 
-  // Carpeta de Drive donde estan los ficheros de periodo. Solo mira los ficheros
-  // que cuelgan directamente de ella; no entra en subcarpetas.
+  // Carpeta de Drive donde estan los ficheros de periodo. Se leen tambien
+  // TODAS sus subcarpetas, a cualquier profundidad: puedes tenerlos ordenados
+  // por ano (2025/, 2026/...) y el script los encuentra igual.
   sourceFolderId: 'PON_AQUI_EL_ID_DE_LA_CARPETA',
 
   // Correo al que llega el aviso cuando una ejecucion falla.
@@ -318,7 +320,7 @@ function listarPestanas() {
   var ss = openSource_(ultimo.id);
   var lines = [];
 
-  lines.push('Fichero mas reciente: ' + ultimo.name + '  (periodo ' + ultimo.periodo + ')');
+  lines.push('Fichero mas reciente: ' + rutaDe_(ultimo) + '  (periodo ' + ultimo.periodo + ')');
   lines.push('Pestanas que tiene:');
 
   // Mapa de pestanas ya configuradas, en forma normalizada para comparar igual
@@ -355,6 +357,120 @@ function listarPestanas() {
 }
 
 /**
+ * QUE HACE: foto detallada de como ve el script cada pestana de origen en el
+ *          fichero mas reciente, y del estado de la pestana equivalente en el
+ *          maestro. No escribe nada en ningun sitio.
+ * CUANDO SE EJECUTA: cuando algo no cuadra. Contesta preguntas como "por que
+ *          solo entra una fila", "cuantas celdas tienen valor en cada columna"
+ *          o "por que el maestro tiene miles de filas vacias".
+ * RESULTADO: Ver > Registro de ejecuciones. Es el texto que hay que revisar
+ *          (o enviar) cuando una pestana se comporta raro.
+ */
+function diagnosticoPestana() {
+  var folder = DriveApp.getFolderById(CONFIG.sourceFolderId);
+  var files = listSourceFiles_(folder);
+  if (!files.length) {
+    throw new Error('No hay ficheros de periodo en la carpeta. Patron usado: ' + pattern_());
+  }
+
+  var ultimo = files[files.length - 1];
+  var ss = openSource_(ultimo.id);
+  var master = SpreadsheetApp.openById(CONFIG.masterFileId);
+
+  var lines = [];
+  lines.push('Fichero analizado: ' + rutaDe_(ultimo) + '  (periodo ' + ultimo.periodo + ')');
+
+  CONFIG.entities.forEach(function (e) {
+    lines.push('');
+    lines.push('=== destino "' + e.destino + '"   <-   pestana "' + e.origen + '" ===');
+
+    // --- Como esta la pestana en el maestro ---
+    var m = master.getSheetByName(e.destino);
+    if (!m) {
+      lines.push('  maestro: la pestana no existe todavia');
+    } else {
+      var conPeriodo = 0;
+      try {
+        conPeriodo = readPeriodColumn_(m).filter(function (p) { return p !== ''; }).length;
+      } catch (err) {
+        lines.push('  maestro: PROBLEMA -> ' + err.message);
+      }
+      lines.push('  maestro: getLastRow=' + m.getLastRow() + ' | filas con periodo=' + conPeriodo);
+      if (m.getLastRow() - 1 > conPeriodo) {
+        lines.push('  OJO: ' + (m.getLastRow() - 1 - conPeriodo) +
+          ' filas las cuenta getLastRow pero no son datos (formato aplicado en vacio).');
+      }
+    }
+
+    // --- Como esta la pestana en el origen ---
+    var nombre;
+    try {
+      nombre = resolveSheetName_(ss, e.origen);
+    } catch (err) {
+      lines.push('  origen: ' + err.message);
+      return;
+    }
+
+    var sh = ss.getSheetByName(nombre);
+    var headerRow = e.headerRow || CONFIG.headerRow;
+    var lastRow = sh.getLastRow();
+    var lastCol = sh.getLastColumn();
+    lines.push('  origen: getLastRow=' + lastRow + ' | getLastColumn=' + lastCol +
+      ' | cabecera en fila=' + headerRow);
+
+    if (lastRow <= headerRow || lastCol === 0) {
+      lines.push('  origen: no hay datos debajo de la cabecera');
+      return;
+    }
+
+    var header = sh.getRange(headerRow, 1, 1, lastCol).getValues()[0]
+      .map(function (v) { return String(v).trim(); });
+
+    lines.push('  cabecera: ' + header.map(function (h, i) {
+      return (i + 1) + '="' + h + '"';
+    }).join(' | '));
+
+    var vacias = header.filter(function (h) { return h === ''; }).length;
+    if (vacias) {
+      lines.push('  OJO: ' + vacias + ' cabeceras vacias. Casi siempre son celdas combinadas:');
+      lines.push('       el script solo puede leer el valor de la primera celda del bloque.');
+    }
+
+    var nFilas = lastRow - headerRow;
+    var datos = sh.getRange(headerRow + 1, 1, nFilas, lastCol).getValues();
+    var conAlgo = datos.filter(function (r) {
+      return r.some(function (c) { return c !== '' && c !== null; });
+    }).length;
+    lines.push('  filas de datos: ' + nFilas + ' | con algun valor: ' + conAlgo);
+
+    // Cuantas celdas con valor hay en cada columna. Si una columna tiene 1 y
+    // deberia tener 500, ahi esta el problema (celdas combinadas o datos
+    // colocados en otro sitio).
+    var conteo = [];
+    for (var c = 0; c < lastCol; c++) {
+      var n = 0;
+      for (var f = 0; f < datos.length; f++) {
+        if (datos[f][c] !== '' && datos[f][c] !== null) n++;
+      }
+      conteo.push((c + 1) + '=' + n);
+    }
+    lines.push('  celdas con valor por columna: ' + conteo.join(' | '));
+
+    lines.push('  primeras 3 filas de datos:');
+    datos.slice(0, 3).forEach(function (r) {
+      lines.push('    ' + r.map(function (v) {
+        var t = (v === '' || v === null) ? '(vacio)' : String(v);
+        return t.length > 22 ? t.slice(0, 22) + '...' : t;
+      }).join(' | '));
+    });
+  });
+
+  var out = lines.join('\n');
+  Logger.log(out);
+  return out;
+}
+
+/**
  * QUE HACE: diagnostico de solo lectura. No escribe nada en ningun sitio: solo
  *           mira la carpeta y el maestro, y escribe un resumen en el registro.
  * CUANDO SE EJECUTA: siempre lo PRIMERO, antes de instalar el trigger. Sirve
@@ -375,7 +491,7 @@ function dryRun() {
 
   // Una linea por fichero: nombre, periodo deducido y fecha que se archivara.
   files.forEach(function (f) {
-    lines.push('  - ' + f.name + '  ->  ' + f.periodo + '  (fecha_reporte ' + formatDate_(fechaReporte_(f.periodo)) + ')');
+    lines.push('  - ' + rutaDe_(f) + '  ->  ' + f.periodo + '  (fecha_reporte ' + formatDate_(fechaReporte_(f.periodo)) + ')');
   });
 
   // Aviso util: se repasa la carpeta y se separan los ficheros que NO encajan
@@ -387,19 +503,18 @@ function dryRun() {
   var rePatron = new RegExp(pattern_(), 'i');
   var otroTipo = [];
   var noEncajan = [];
-  var it2 = folder.getFiles();
-  while (it2.hasNext()) {
-    var nombreOtro = it2.next().getName();
+  todosLosFicheros_(folder).forEach(function (item) {
+    var nombreOtro = item.name;
     var baseOtro = nombreOtro.replace(/\.[A-Za-z0-9]+$/, '');
-    if (baseOtro.match(rePatron) || nombreOtro.match(rePatron)) continue;
+    if (baseOtro.match(rePatron) || nombreOtro.match(rePatron)) return;
 
     var coincidencia = baseOtro.match(parecePeriodo) || nombreOtro.match(parecePeriodo);
     if (coincidencia) {
-      otroTipo.push(nombreOtro + ' (tipo ' + coincidencia[1].toUpperCase() + ', se esperaba ' + letraEsperada + ')');
+      otroTipo.push(rutaDe_(item) + ' (tipo ' + coincidencia[1].toUpperCase() + ', se esperaba ' + letraEsperada + ')');
     } else if (noEncajan.length < 5) {
-      noEncajan.push(nombreOtro);
+      noEncajan.push(rutaDe_(item));
     }
-  }
+  });
   if (otroTipo.length) {
     lines.push('OJO, ignorados por ser del otro tipo: ' + otroTipo.join(' | '));
   }
@@ -437,7 +552,7 @@ function dryRun() {
     var ultimoFichero = files[files.length - 1];
     var fuente = openSource_(ultimoFichero.id);
     lines.push('');
-    lines.push('Pestanas configuradas, comprobadas en "' + ultimoFichero.name + '":');
+    lines.push('Pestanas configuradas, comprobadas en "' + rutaDe_(ultimoFichero) + '":');
     CONFIG.entities.forEach(function (e) {
       try {
         var nombreReal = resolveSheetName_(fuente, e.origen);
@@ -551,13 +666,10 @@ function ingest_(opts) {
 
   if (!allFiles.length) {
     // Cuando no encaja ningun fichero, el mensaje muestra lo que si hay en la
-    // carpeta: casi siempre es un nombre mal escrito o un ajuste del patron.
-    var muestra = [];
-    var itNombres = folder.getFiles();
-    while (itNombres.hasNext() && muestra.length < 5) {
-      muestra.push(itNombres.next().getName());
-    }
-    throw new Error('No hay ficheros en la carpeta que cumplan el patron de nombre. Patron usado: ' + pattern_() +
+    // carpeta (y sus subcarpetas): casi siempre es un nombre mal escrito o un
+    // ajuste del patron.
+    var muestra = todosLosFicheros_(folder).slice(0, 5).map(rutaDe_);
+    throw new Error('No hay ficheros que cumplan el patron de nombre. Patron usado: ' + pattern_() +
       (muestra.length ? '. En la carpeta hay: ' + muestra.join(' | ') : '. La carpeta esta vacia o no es accesible.') +
       '. Revisa CONFIG.filenamePattern.');
   }
@@ -739,11 +851,13 @@ function ingestEntity_(master, srcSs, entity, entry, isLatest, warnings) {
   });
 
   // Upsert: fuera las filas previas de este periodo, luego append de una sola
-  // escritura. getLastRow() se consulta despues de borrar, para escribir justo
-  // debajo de la ultima fila que queda.
+  // escritura. La fila de destino se calcula por la ultima fila que tiene
+  // periodo, NO por getLastRow(): si la pestana trae formato aplicado muy abajo,
+  // getLastRow() devuelve miles de filas y el script escribiria al final del
+  // vacio, dejando un hueco enorme en medio.
   deletePeriodRows_(masterSheet, entry.periodo);
-  var startRow = masterSheet.getLastRow() + 1;
-  masterSheet.getRange(startRow, 1, payload.length, masterHeader.length).setValues(payload);
+  var startRow = ultimaFilaDeDatos_(masterSheet) + 1;
+  escribirFilas_(masterSheet, startRow, payload, warnings, entity.destino, entry.periodo);
 }
 
 // ============================================================================
@@ -892,6 +1006,60 @@ function deletePeriodRows_(sheet, periodo) {
 }
 
 /**
+ * QUE HACE: devuelve el numero de la ultima fila que tiene periodo escrito, es
+ *          decir, la ultima fila que el script reconocera como dato.
+ * POR QUE NO getLastRow(): getLastRow() cuenta tambien las filas que solo tienen
+ *          FORMATO (color, bordes, ancho fijado). Si alguien dejo formato
+ *          aplicado hasta la fila 5000, getLastRow() devuelve 5000 y el script
+ *          escribiria en la 5001, dejando miles de filas vacias en medio.
+ */
+function ultimaFilaDeDatos_(sheet) {
+  var last = sheet.getLastRow();
+  if (last < 2) return 1;
+
+  var col = periodoColumn_(sheet);
+  var vals = sheet.getRange(2, col, last - 1, 1).getValues();
+
+  // Se recorre de abajo arriba: la primera fila con algo es la ultima de datos.
+  for (var i = vals.length - 1; i >= 0; i--) {
+    if (String(vals[i][0]).trim() !== '') return i + 2;
+  }
+  return 1;
+}
+
+/**
+ * QUE HACE: escribe las filas en el maestro.
+ * SI LA HOJA SE QUEJA DE "data validation": la pestana destino trae una regla
+ *   de validacion con "rechazar entrada" (listas, casillas, numeros con rango)
+ *   que bloquea la escritura. En una pestana que escribe el script esa regla no
+ *   aporta nada y rompe la carga, asi que se quita solo del rango que se va a
+ *   escribir y se reintenta. Queda anotado como aviso en el resumen.
+ */
+function escribirFilas_(sheet, startRow, payload, warnings, destino, periodo) {
+  var rango = sheet.getRange(startRow, 1, payload.length, payload[0].length);
+
+  try {
+    rango.setValues(payload);
+    return;
+  } catch (err) {
+    Logger.log('La escritura fallo (posible validacion de datos). Se quita la validacion del rango y se reintenta. ' +
+      'Detalle: ' + err.message);
+  }
+
+  try {
+    rango.setDataValidation(null);
+    rango.setValues(payload);
+  } catch (err2) {
+    throw new Error('no se pudo escribir en la pestana "' + sheet.getName() + '": ' + err2.message);
+  }
+
+  if (warnings) {
+    warnings.push(destino + ' @ ' + periodo +
+      ': habia validacion de datos en el destino y se ha quitado para poder escribir');
+  }
+}
+
+/**
  * QUE HACE: retencion. Se queda con los CONFIG.windowPeriods periodos mas
  *          recientes y borra las filas de todos los demas.
  * DETALLE: el orden se calcula con ordenDe_ (numero), nunca comparando el texto
@@ -942,7 +1110,11 @@ function applyRetention_(master, entity) {
  */
 function formatearFechas_(sheet) {
   if (!sheet) return;
-  var last = sheet.getLastRow();
+
+  // Se usa la ultima fila con periodo, no getLastRow(): si la hoja trae formato
+  // hasta abajo, no queremos repintar miles de filas vacias (eso perpetuaria el
+  // problema de tamano).
+  var last = ultimaFilaDeDatos_(sheet);
   if (last < 2) return;
 
   var header = readHeader_(sheet);
@@ -995,9 +1167,44 @@ function deleteRowsGrouped_(sheet, rows) {
 // ============================================================================
 
 /**
- * QUE HACE: recorre la carpeta y devuelve solo los ficheros cuyo nombre encaja
- *          con el patron, con su periodo ya deducido.
- * DEVUELVE: lista de objetos {id, name, periodo, anio, semana, orden,
+ * QUE HACE: recorre la carpeta y TODAS sus subcarpetas, y devuelve todos los
+ *          ficheros que encuentra, cada uno con la ruta de carpetas donde esta.
+ * DEVUELVE: lista de {file, name, ruta}. "ruta" es algo como "2026/Semanas/".
+ * PARA QUE SIRVA LA RUTA: con carpetas por ano, dos ficheros pueden llamarse
+ *          igual; la ruta es lo que permite decir cual es cual en los mensajes.
+ * DETALLE: la recursion entra a cualquier profundidad. Drive no permite bucles
+ *          de carpetas, asi que no hay riesgo de quedarse dando vueltas.
+ */
+function todosLosFicheros_(folder, prefijo, out) {
+  out = out || [];
+  prefijo = prefijo || '';
+
+  // Primero los ficheros de este nivel.
+  var itF = folder.getFiles();
+  while (itF.hasNext()) {
+    var f = itF.next();
+    out.push({ file: f, name: f.getName(), ruta: prefijo });
+  }
+
+  // Despues se baja a cada subcarpeta, anadiendo su nombre a la ruta.
+  var itD = folder.getFolders();
+  while (itD.hasNext()) {
+    var sub = itD.next();
+    todosLosFicheros_(sub, prefijo + sub.getName() + '/', out);
+  }
+
+  return out;
+}
+
+/** Devuelve la ruta completa de un fichero, para los mensajes y el registro. */
+function rutaDe_(entrada) {
+  return (entrada.ruta || '') + entrada.name;
+}
+
+/**
+ * QUE HACE: recorre la carpeta y sus subcarpetas, y devuelve solo los ficheros
+ *          cuyo nombre encaja con el patron, con su periodo ya deducido.
+ * DEVUELVE: lista de objetos {id, name, ruta, periodo, anio, semana, orden,
  *          fechaReporte}, ordenada del periodo mas antiguo al mas reciente.
  * DETALLE: vale cualquier texto delante del periodo ("fichero pruebas - Y26W48")
  *          y tambien con extension ("... - Y26W48.xlsx"), porque la extension
@@ -1005,18 +1212,19 @@ function deleteRowsGrouped_(sheet, rows) {
  */
 function listSourceFiles_(folder) {
   var re = new RegExp(pattern_(), 'i');
-  var it = folder.getFiles();
+  var todos = todosLosFicheros_(folder);
   var out = [];
 
-  // Sirve para detectar el mismo periodo escrito de dos formas (Y26W5 / Y26W05).
+  // Sirve para detectar dos ficheros del mismo periodo (mismo fichero duplicado
+  // en dos carpetas, o Y26W5 / Y26W05). Guarda la ruta para poder senalarlos.
   var porOrden = {};
 
-  // getFiles() devuelve un "iterador": se recorre con hasNext() y next().
-  while (it.hasNext()) {
-    var file = it.next();
+  todos.forEach(function (item) {
+    var file = item.file;
+    var ruta = rutaDe_(item);
 
     // Quita la extension final, si la hay (punto + letras o numeros).
-    var nombre = file.getName();
+    var nombre = item.name;
     var base = nombre.replace(/\.[A-Za-z0-9]+$/, '');
 
     // Se prueba con y sin extension, para que valgan tanto "x - Y26W48" como
@@ -1024,7 +1232,7 @@ function listSourceFiles_(folder) {
     var m = base.match(re) || nombre.match(re);
 
     // Si el nombre no encaja con el patron, se ignora sin avisar.
-    if (!m) continue;
+    if (!m) return;
 
     // m[1] son las dos cifras del ano (26) y m[2] el numero de semana o de mes.
     var anoCorto = m[1];
@@ -1041,24 +1249,25 @@ function listSourceFiles_(folder) {
     // texto tal cual: por orden alfabetico "Y26W5" iria DESPUES de "Y26W48".
     var orden = year * 100 + num;
 
-    // Dos ficheros con la misma clave son el mismo periodo escrito de dos
-    // formas distintas: eso descuadraria la retencion, asi que se para aqui.
-    if (porOrden[orden] && porOrden[orden] !== periodo) {
-      throw new Error('dos ficheros representan el mismo periodo: "' + porOrden[orden] + '" y "' +
-        periodo + '". Deja solo uno y unifica el formato.');
+    // Dos ficheros con la misma clave son el mismo periodo: al cargar uno
+    // pisaria al otro y no sabrias cual quedo. Se para y se dicen las rutas.
+    if (porOrden[orden]) {
+      throw new Error('hay dos ficheros para el mismo periodo (' + periodo + '): "' + porOrden[orden] +
+        '" y "' + ruta + '". Deja solo uno.');
     }
-    porOrden[orden] = periodo;
+    porOrden[orden] = ruta;
 
     out.push({
       id: file.getId(),
-      name: file.getName(),
+      name: nombre,
+      ruta: item.ruta,
       periodo: periodo,
       anio: year,
       semana: (CONFIG.periodFormat === 'MONTH') ? '' : num,
       orden: orden,
       fechaReporte: fechaReporte_(periodo)
     });
-  }
+  });
 
   // Orden por la clave numerica, que si es cronologico de verdad.
   out.sort(function (a, b) { return a.orden - b.orden; });
