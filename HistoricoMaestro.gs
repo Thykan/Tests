@@ -583,6 +583,151 @@ function diagnosticoColumnas() {
 }
 
 /**
+ * QUE HACE: recorre TODOS los ficheros de periodo y compara las columnas de cada
+ *          pestana con el esquema habitual (el que tiene la mayoria). Devuelve
+ *          la lista de ficheros que se desvian y en que columna exactamente.
+ * PARA QUE: si el maestro tiene datos partidos entre dos columnas, esto dice
+ *          QUE FICHEROS hay que corregir en el origen, no solo que hay un lio.
+ * COMO SE LEE:
+ *          "esquema habitual (147 ficheros): cliente, importe, canal"
+ *          "desviaciones: 3"
+ *          "  - 2024/f - Y24W31: falta: canal | sobra: canal_venta"
+ *          Ese fichero tiene la columna renombrada: se corrige en el origen.
+ * TARDA: abre cada fichero, asi que con 150 ficheros puede irse a un par de
+ *          minutos. Es de solo lectura: no escribe nada.
+ * RESULTADO: Ver > Registro de ejecuciones.
+ */
+function diagnosticoFicheros() {
+  var folder = DriveApp.getFolderById(CONFIG.sourceFolderId);
+  var files = listSourceFiles_(folder);
+  if (!files.length) {
+    throw new Error('No hay ficheros de periodo en la carpeta. Patron usado: ' + pattern_());
+  }
+
+  var master = SpreadsheetApp.openById(CONFIG.masterFileId);
+
+  // 1. Se abre cada fichero UNA vez y se guardan las cabeceras de cada entidad.
+  var recogidas = {};
+  var erroresApertura = {};
+  CONFIG.entities.forEach(function (e) { recogidas[e.destino] = []; });
+
+  files.forEach(function (f) {
+    var ss = null;
+    var fallo = null;
+    try {
+      ss = openSource_(f.id);
+    } catch (err) {
+      fallo = err.message;
+    }
+
+    CONFIG.entities.forEach(function (e) {
+      if (!ss) {
+        erroresApertura[e.destino] = erroresApertura[e.destino] || [];
+        erroresApertura[e.destino].push(rutaDe_(f) + ': ' + fallo);
+        return;
+      }
+      try {
+        var sh = ss.getSheetByName(resolveSheetName_(ss, e.origen));
+        var hr = e.headerRow || CONFIG.headerRow;
+        if (sh.getLastRow() < hr || sh.getLastColumn() === 0) {
+          recogidas[e.destino].push({ ruta: rutaDe_(f), error: 'la pestana "' + e.origen + '" no tiene datos' });
+          return;
+        }
+        var h = sh.getRange(hr, 1, 1, sh.getLastColumn()).getValues()[0]
+          .map(function (v) { return String(v).trim(); })
+          .filter(function (v) { return v !== ''; });
+        recogidas[e.destino].push({ ruta: rutaDe_(f), header: h });
+      } catch (err) {
+        recogidas[e.destino].push({ ruta: rutaDe_(f), error: err.message });
+      }
+    });
+  });
+
+  // 2. Por entidad: esquema mas frecuente y ficheros que se desvian de el.
+  var lines = ['Comparacion de las columnas de cada fichero con el esquema habitual.'];
+  lines.push('Ficheros de periodo encontrados: ' + files.length);
+
+  CONFIG.entities.forEach(function (e) {
+    lines.push('');
+    lines.push('=== destino "' + e.destino + '"  <-  pestana "' + e.origen + '" ===');
+
+    var lista = recogidas[e.destino];
+    var cuenta = {};
+    lista.forEach(function (x) {
+      if (!x.header) return;
+      var clave = x.header.join(' | ');
+      cuenta[clave] = (cuenta[clave] || 0) + 1;
+    });
+
+    // El esquema habitual es el que mas se repite. Se compara con el, no con el
+    // maestro: si el maestro ya tiene una columna fantasma, compararlo con el
+    // marcaria como raros los 147 ficheros buenos.
+    var habitual = null;
+    var veces = 0;
+    Object.keys(cuenta).forEach(function (k) {
+      if (cuenta[k] > veces) { veces = cuenta[k]; habitual = k; }
+    });
+
+    if (!habitual) {
+      lines.push('  no se ha podido leer ninguna cabecera');
+      return;
+    }
+
+    var columnasHabituales = habitual === '' ? [] : habitual.split(' | ');
+    lines.push('  esquema habitual (' + veces + ' ficheros): ' + habitual);
+
+    // Referencia: lo que tiene el maestro ahora mismo.
+    var shMaster = master.getSheetByName(e.destino);
+    if (shMaster) {
+      var hMaster = readHeader_(shMaster);
+      var hm = hMaster.slice(META_HEADERS.length, hMaster.length - 1);
+      lines.push('  el maestro tiene: ' + (hm.join(' | ') || '(ninguna)'));
+      var sobranEnMaestro = hm.filter(function (c) { return columnasHabituales.indexOf(c) === -1; });
+      if (sobranEnMaestro.length) {
+        lines.push('  OJO: el maestro conserva columnas que el origen ya no trae: ' + sobranEnMaestro.join(', ') +
+          '. Esas son las que hay que borrar del maestro.');
+      }
+    } else {
+      lines.push('  el maestro todavia no tiene esa pestana');
+    }
+
+    // Desviaciones: ficheros cuyo juego de columnas no es el habitual.
+    var desvios = lista.filter(function (x) {
+      if (x.error) return true;
+      return x.header.join(' | ') !== habitual;
+    });
+
+    lines.push('  desviaciones: ' + desvios.length + ' de ' + lista.length);
+    desvios.sort(function (a, b) { return a.ruta < b.ruta ? -1 : 1; });
+    desvios.forEach(function (x) {
+      if (x.error) {
+        lines.push('  - ' + x.ruta + ': ' + x.error);
+        return;
+      }
+      var faltan = columnasHabituales.filter(function (c) { return x.header.indexOf(c) === -1; });
+      var sobran = x.header.filter(function (c) { return columnasHabituales.indexOf(c) === -1; });
+      var detalle = [];
+      if (faltan.length) detalle.push('falta: ' + faltan.join(', '));
+      if (sobran.length) detalle.push('sobra: ' + sobran.join(', '));
+      lines.push('  - ' + x.ruta + ': ' + detalle.join(' | '));
+    });
+
+    var fallos = erroresApertura[e.destino] || [];
+    if (fallos.length) {
+      lines.push('  no se pudieron abrir: ' + fallos.length);
+      fallos.slice(0, 10).forEach(function (m) { lines.push('  - ' + m); });
+    }
+  });
+
+  lines.push('');
+  lines.push('Cada linea "- ..." es un fichero a corregir en el origen.');
+
+  var out = lines.join('\n');
+  Logger.log(out);
+  return out;
+}
+
+/**
  * QUE HACE: diagnostico de solo lectura. No escribe nada en ningun sitio: solo
  *           mira la carpeta y el maestro, y escribe un resumen en el registro.
  * CUANDO SE EJECUTA: siempre lo PRIMERO, antes de instalar el trigger. Sirve
