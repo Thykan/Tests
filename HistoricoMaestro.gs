@@ -154,11 +154,14 @@ var CONFIG = {
   // saber que letra esperar y para poner el trigger semanal o mensual.
   periodFormat: 'ISO_WEEK',
 
-  // Patron del nombre de fichero. Si lo dejas vacio se deduce solo de
-  // periodFormat. Solo lo cambias si tus ficheros se llaman de otra forma.
-  // Ejemplos para el formato Y26W48 / Y26M11:
-  //   '^Y(\\d{2})W(\\d{1,2})$'   (semanal)
-  //   '^Y(\\d{2})M(\\d{1,2})$'   (mensual)
+  // Patron que deben cumplir los nombres de fichero. Por defecto vale cualquier
+  // texto delante y exige que el nombre TERMINE con el periodo, porque es lo
+  // habitual en tus ficheros: "fichero pruebas - Y26W48".
+  // Ejemplos para Y26W48 / Y26M11:
+  //   'Y(\\d{2})W(\\d{1,2})$'   (semanal: el periodo al final)
+  //   'Y(\\d{2})M(\\d{1,2})$'   (mensual: el periodo al final)
+  // Si el nombre fuera SOLO el periodo, se pondria con ^ delante:
+  //   '^Y(\\d{2})W(\\d{1,2})$'
   // Los dobles backslash son obligatorios: es la forma de escribir \d en texto.
   // \\d{1,2} acepta tanto Y26W5 como Y26W05.
   filenamePattern: '',
@@ -289,23 +292,33 @@ function dryRun() {
     lines.push('  - ' + f.name + '  ->  ' + f.periodo + '  (fecha_reporte ' + formatDate_(fechaReporte_(f.periodo)) + ')');
   });
 
-  // Aviso util: ficheros con pinta de periodo pero del otro tipo (por ejemplo
-  // un mensual Y26M11 en un script semanal). Al cargar se ignoran en silencio,
-  // asi que aqui se delatan para que no parezca que el script no los ve.
+  // Aviso util: se repasa la carpeta y se separan los ficheros que NO encajan
+  // con el patron. Los que parecen de periodo pero son del otro tipo (un
+  // mensual Y26M11 en un script semanal) se nombran aparte, porque al cargar se
+  // ignoran en silencio y pareceria que el script no los ve.
   var letraEsperada = (CONFIG.periodFormat === 'MONTH') ? 'M' : 'W';
-  var parecePeriodo = /^Y\d{2}([WM])\d{1,2}$/;
-  var descartados = [];
+  var parecePeriodo = /Y\d{2}([WM])\d{1,2}$/i;
+  var rePatron = new RegExp(pattern_(), 'i');
+  var otroTipo = [];
+  var noEncajan = [];
   var it2 = folder.getFiles();
   while (it2.hasNext()) {
-    var otro = it2.next();
-    var otroBase = otro.getName().replace(/\.[A-Za-z0-9]+$/, '');
-    var coincidencia = otroBase.match(parecePeriodo);
-    if (coincidencia && coincidencia[1] !== letraEsperada) {
-      descartados.push(otro.getName() + ' (tipo ' + coincidencia[1] + ', se esperaba ' + letraEsperada + ')');
+    var nombreOtro = it2.next().getName();
+    var baseOtro = nombreOtro.replace(/\.[A-Za-z0-9]+$/, '');
+    if (baseOtro.match(rePatron) || nombreOtro.match(rePatron)) continue;
+
+    var coincidencia = baseOtro.match(parecePeriodo) || nombreOtro.match(parecePeriodo);
+    if (coincidencia) {
+      otroTipo.push(nombreOtro + ' (tipo ' + coincidencia[1].toUpperCase() + ', se esperaba ' + letraEsperada + ')');
+    } else if (noEncajan.length < 5) {
+      noEncajan.push(nombreOtro);
     }
   }
-  if (descartados.length) {
-    lines.push('OJO, ignorados con pinta de periodo: ' + descartados.join(' | '));
+  if (otroTipo.length) {
+    lines.push('OJO, ignorados por ser del otro tipo: ' + otroTipo.join(' | '));
+  }
+  if (noEncajan.length) {
+    lines.push('No encajan con el patron (se ignoran): ' + noEncajan.join(' | '));
   }
 
   lines.push('');
@@ -434,7 +447,16 @@ function ingest_(opts) {
   var allFiles = listSourceFiles_(folder);
 
   if (!allFiles.length) {
-    throw new Error('No hay ficheros en la carpeta que cumplan el patron de nombre. Patron usado: ' + pattern_());
+    // Cuando no encaja ningun fichero, el mensaje muestra lo que si hay en la
+    // carpeta: casi siempre es un nombre mal escrito o un ajuste del patron.
+    var muestra = [];
+    var itNombres = folder.getFiles();
+    while (itNombres.hasNext() && muestra.length < 5) {
+      muestra.push(itNombres.next().getName());
+    }
+    throw new Error('No hay ficheros en la carpeta que cumplan el patron de nombre. Patron usado: ' + pattern_() +
+      (muestra.length ? '. En la carpeta hay: ' + muestra.join(' | ') : '. La carpeta esta vacia o no es accesible.') +
+      '. Revisa CONFIG.filenamePattern.');
   }
 
   // El periodo mas reciente de la carpeta define el esquema "vigente": solo ese
@@ -833,11 +855,12 @@ function deleteRowsGrouped_(sheet, rows) {
  *          con el patron, con su periodo ya deducido.
  * DEVUELVE: lista de objetos {id, name, periodo, anio, semana, orden,
  *          fechaReporte}, ordenada del periodo mas antiguo al mas reciente.
- * DETALLE: la extension se quita antes de comparar, asi que funciona igual con
- *          "Y26W48" que con "Y26W48.xlsx" o "Y26W48 copia".
+ * DETALLE: vale cualquier texto delante del periodo ("fichero pruebas - Y26W48")
+ *          y tambien con extension ("... - Y26W48.xlsx"), porque la extension
+ *          se quita antes de comparar. Mayusculas y minusculas dan igual.
  */
 function listSourceFiles_(folder) {
-  var re = new RegExp(pattern_());
+  var re = new RegExp(pattern_(), 'i');
   var it = folder.getFiles();
   var out = [];
 
@@ -849,8 +872,12 @@ function listSourceFiles_(folder) {
     var file = it.next();
 
     // Quita la extension final, si la hay (punto + letras o numeros).
-    var base = file.getName().replace(/\.[A-Za-z0-9]+$/, '');
-    var m = base.match(re);
+    var nombre = file.getName();
+    var base = nombre.replace(/\.[A-Za-z0-9]+$/, '');
+
+    // Se prueba con y sin extension, para que valgan tanto "x - Y26W48" como
+    // "x - Y26W48.xlsx". El patron exige que el periodo quede al final.
+    var m = base.match(re) || nombre.match(re);
 
     // Si el nombre no encaja con el patron, se ignora sin avisar.
     if (!m) continue;
@@ -898,12 +925,13 @@ function listSourceFiles_(folder) {
  * QUE HACE: devuelve el patron (expresion regular) que deben cumplir los
  *          nombres de fichero. Si CONFIG.filenamePattern esta relleno, se usa
  *          tal cual; si no, se deduce de periodFormat.
- * EJEMPLO SEMANAL: Y26W48 -> Y = ano, 26 = 2026, W = semana, 48 = semana 48.
+ * EJEMPLO SEMANAL: "fichero pruebas - Y26W48" -> vale, porque el periodo esta
+ *          al final. Y = ano, 26 = 2026, W = semana, 48 = semana 48.
  * DETALLE: \\d{1,2} acepta una o dos cifras, para que Y26W5 y Y26W05 valgan.
  */
 function pattern_() {
   if (CONFIG.filenamePattern) return CONFIG.filenamePattern;
-  return (CONFIG.periodFormat === 'MONTH') ? '^Y(\\d{2})M(\\d{1,2})$' : '^Y(\\d{2})W(\\d{1,2})$';
+  return (CONFIG.periodFormat === 'MONTH') ? 'Y(\\d{2})M(\\d{1,2})$' : 'Y(\\d{2})W(\\d{1,2})$';
 }
 
 /**
