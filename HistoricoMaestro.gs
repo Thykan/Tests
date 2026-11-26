@@ -561,6 +561,13 @@ function ingest_(opts) {
     }
   }
 
+  // Primero se valida (o se crea) cada pestana destino del maestro. Se hace
+  // antes de leer nada para que cualquier problema de estructura salga aqui,
+  // con un mensaje que diga que pasa, y no como un error suelto mas adelante.
+  CONFIG.entities.forEach(function (e) {
+    ensureMasterTab_(master, e);
+  });
+
   // Cache de periodos ya presentes por entidad, para no leer la columna N veces.
   // periodCache['entidad_a']['Y26W47'] = true significa "ese periodo ya esta".
   var periodCache = {};
@@ -755,9 +762,12 @@ function ensureMasterTab_(master, entity) {
   var current = readHeader_(sheet);
   for (var i = 0; i < META_HEADERS.length; i++) {
     if (current[i] !== META_HEADERS[i]) {
-      throw new Error('la pestana destino "' + entity.destino + '" no empieza con la cabecera esperada: ' +
-        'columna ' + (i + 1) + ' deberia ser "' + META_HEADERS[i] + '" y es "' + (current[i] || '') + '". ' +
-        'Renombra el fichero maestro o corrige la cabecera a mano.');
+      throw new Error('la pestana "' + entity.destino + '" ya existe en el maestro pero no tiene el formato del maestro: ' +
+        'su columna ' + (i + 1) + ' es "' + (current[i] || 'vacia') + '" y deberia ser "' + META_HEADERS[i] + '". ' +
+        'Esas columnas las genera el script a partir de la fecha del fichero, no tienen que venir en el origen. ' +
+        'Revisa que masterFileId apunte al fichero maestro y no a uno de los ficheros de periodo, ' +
+        'y que el "destino" de esta entidad no choque con una pestana que ya existia. ' +
+        'Si esa pestana sobra, renombrala o borrala.');
     }
   }
   if (current[current.length - 1] !== CACHE_HEADER) {
@@ -828,7 +838,9 @@ function ensureColumns_(sheet, srcHeader, isLatest, warnings, destino, periodo) 
 function periodoColumn_(sheet) {
   var idx = readHeader_(sheet).indexOf('periodo');
   if (idx === -1) {
-    throw new Error('la pestana "' + sheet.getName() + '" no tiene columna "periodo"');
+    throw new Error('la pestana "' + sheet.getName() + '" del maestro no tiene columna "periodo". ' +
+      'Esa columna la genera el script a partir de la fecha del fichero; si esa pestana no la creo el script, ' +
+      'renombrala o cambia el "destino" de la entidad.');
   }
   return idx + 1;
 }
@@ -1228,3 +1240,4 @@ function notify_(subject, body) {
     Logger.log('No se pudo enviar el correo de aviso: ' + e.message);
   }
 }
+
