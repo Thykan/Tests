@@ -93,6 +93,12 @@
  *   - La fila 1 no se toca jamas: el data source de Looker no se rompe.
  *   - Solo hojas de Google: si en la carpeta aparece otro tipo de fichero con
  *     nombre de periodo, se rechaza con error explicito.
+ *   - Fechas siempre en formato europeo dd/mm/aaaa, nunca anglosajon. El valor
+ *     sigue siendo una fecha de verdad (para que Looker ordene y filtre); lo que
+ *     se fija es como se muestra, aunque la hoja este en otro idioma.
+ *   - #N/A se archiva tal cual: una formula sin resultados es un dato, no un
+ *     fallo de ejecucion. Solo se informa en el resumen. Los errores de verdad
+ *     (#REF!, #VALUE!, #DIV/0!...) si abortan.
  *
  * ----------------------------------------------------------------------------
  * PUESTA EN MARCHA (en este orden)
@@ -171,8 +177,10 @@ var CONFIG = {
   // Fila donde empiezan las cabeceras en las pestanas de origen. Casi siempre 1.
   headerRow: 1,
 
-  // Si es true, la ejecucion se corta cuando encuentra celdas con error
-  // (#REF!, #N/A, #DIV/0!...). Mejor dejarlo en true: no quieres archivar basura.
+  // Si es true, la ejecucion se corta cuando encuentra errores de formula de
+  // verdad (#REF!, #VALUE!, #DIV/0!...). #N/A NO cuenta como error: significa
+  // "la formula no encontro resultados" y se archiva tal cual, avisando en el
+  // resumen. Dejalo en true para no archivar formulas rotas.
   failOnErrorCells: true,
 
   // ESTA ES LA LISTA DE PESTANAS QUE SE HISTORIZAN. Una linea por pestana.
@@ -210,6 +218,12 @@ var META_HEADERS = ['periodo', 'anio', 'semana', 'fecha_reporte'];
 
 // Columna que se pone siempre al final: cuando se copio esa fila al maestro.
 var CACHE_HEADER = 'fecha_carga';
+
+// Formato de fecha OBLIGATORIO en el maestro: dia/mes/ano, nunca mes/dia/ano.
+// Se aplica como formato de celda, asi que se respeta aunque la hoja este
+// configurada en ingles. El valor guardado sigue siendo una fecha real.
+var FORMATO_FECHA = 'dd/MM/yyyy';
+var FORMATO_FECHA_HORA = 'dd/MM/yyyy HH:mm:ss';
 
 // Cuanto espera (en milisegundos) si ya hay otra ejecucion en marcha antes de
 // rendirse. 30000 = 30 segundos.
@@ -618,11 +632,13 @@ function ingest_(opts) {
   });
 
   // Retencion al final, una vez por entidad: aqui se borran los periodos viejos.
+  // Despues se fija el formato europeo de las columnas de fecha.
   CONFIG.entities.forEach(function (e) {
     try {
       applyRetention_(master, e);
+      formatearFechas_(master.getSheetByName(e.destino));
     } catch (err) {
-      summary.failed.push('retencion / ' + e.destino + ': ' + err.message);
+      summary.failed.push('retencion/formatos / ' + e.destino + ': ' + err.message);
     }
   });
 
@@ -683,9 +699,9 @@ function ingestEntity_(master, srcSs, entity, entry, isLatest, warnings) {
   var srcHeader = block.shift().map(function (h) { return String(h).trim(); });
   assertHeader_(srcHeader, entity.origen);
 
-  // 4. Si alguna celda trae un error de formula, se aborta antes de archivar.
+  // 4. Celdas de error: #N/A se archiva (solo avisa), el resto de errores para.
   if (CONFIG.failOnErrorCells) {
-    assertNoErrors_(block, entity.origen, headerRow);
+    assertNoErrors_(block, entity.origen, headerRow, warnings, entity.destino, entry.periodo);
   }
 
   // 5. Se descartan las filas totalmente vacias que suelen quedar al final.
@@ -916,6 +932,33 @@ function applyRetention_(master, entity) {
 }
 
 /**
+ * QUE HACE: fija el formato europeo (dia/mes/ano) de las columnas de fecha del
+ *          maestro.
+ * POR QUE: el valor guardado es una fecha real y no cambia; lo que se fija es
+ *          como se pinta. Sin esto, una hoja configurada en ingles mostraria
+ *          mes/dia/ano, y el requisito es que NUNCA salga el formato anglosajon.
+ * CUANDO: al final de cada ejecucion, sobre el rango que tiene datos (nunca
+ *          sobre la columna entera, para no engordar la hoja).
+ */
+function formatearFechas_(sheet) {
+  if (!sheet) return;
+  var last = sheet.getLastRow();
+  if (last < 2) return;
+
+  var header = readHeader_(sheet);
+  var columnas = [
+    ['fecha_reporte', FORMATO_FECHA],
+    [CACHE_HEADER, FORMATO_FECHA_HORA]
+  ];
+
+  columnas.forEach(function (par) {
+    var idx = header.indexOf(par[0]);
+    if (idx === -1) return;
+    sheet.getRange(2, idx + 1, last - 1, 1).setNumberFormat(par[1]);
+  });
+}
+
+/**
  * QUE HACE: borra filas por numero, agrupando las consecutivas y de abajo hacia
  *          arriba.
  * POR QUE ASI: borrar fila a fila es lentisimo, y borrar de arriba abajo
@@ -1133,11 +1176,11 @@ function ordenDe_(periodo) {
 }
 
 /**
- * QUE HACE: pasa una fecha a texto "ano-mes-dia" para poder mostrarla en el
- *          registro de ejecuciones.
+ * QUE HACE: pasa una fecha a texto dia/mes/ano para mostrarla en el registro de
+ *          ejecuciones. Formato europeo, nunca anglosajon.
  */
 function formatDate_(d) {
-  return Utilities.formatDate(d, CONFIG.timezone, 'yyyy-MM-dd');
+  return Utilities.formatDate(d, CONFIG.timezone, FORMATO_FECHA);
 }
 
 // ============================================================================
@@ -1206,25 +1249,36 @@ function assertHeader_(header, sheetName) {
 }
 
 /**
- * QUE HACE: busca celdas que contengan errores de formula (#REF!, #N/A...).
- * POR QUE: si una formula del origen esta rota, es mejor parar que archivar el
- *          error y arrastrarlo al maestro y a Looker.
- * DETALLE: solo se listan las 5 primeras para que el mensaje sea legible.
+ * QUE HACE: revisa las celdas de error de formula y trata cada tipo como toca.
+ *   - #N/A: es "la formula no encontro resultados". No es un fallo: es un dato
+ *     que hay que archivar. Se cuenta y se avisa, pero no se para.
+ *   - #REF!, #VALUE!, #DIV/0!, #NAME?, #NULL!, #NUM!, #ERROR!: eso si es una
+ *     formula rota. Se para la ejecucion para no arrastrarla al maestro.
+ * DETALLE: solo se listan las 5 primeras rotas, para que el mensaje se lea.
  */
-function assertNoErrors_(rows, sheetName, headerRow) {
-  var pattern = /^#(REF|N\/A|DIV\/0|VALUE|NAME|NULL|NUM|ERROR)/;
+function assertNoErrors_(rows, sheetName, headerRow, warnings, destino, periodo) {
+  var rotas = /^#(REF|VALUE|DIV\/0|NAME|NULL|NUM|ERROR)/;
+  var sinResultado = /^#N\/A/;
   var bad = [];
+  var na = 0;
 
   rows.forEach(function (row, ri) {
     row.forEach(function (cell) {
-      if (typeof cell === 'string' && pattern.test(cell.trim())) {
-        if (bad.length < 5) bad.push('fila ' + (ri + headerRow + 1) + ': ' + cell.trim());
+      if (typeof cell !== 'string') return;
+      var v = cell.trim();
+      if (rotas.test(v)) {
+        if (bad.length < 5) bad.push('fila ' + (ri + headerRow + 1) + ': ' + v);
+      } else if (sinResultado.test(v)) {
+        na++;
       }
     });
   });
 
   if (bad.length) {
     throw new Error('celdas con error en la pestana "' + sheetName + '": ' + bad.join(' | '));
+  }
+  if (na && warnings) {
+    warnings.push(destino + ' @ ' + periodo + ': ' + na + ' celdas con #N/A archivadas tal cual');
   }
 }
 
@@ -1240,4 +1294,3 @@ function notify_(subject, body) {
     Logger.log('No se pudo enviar el correo de aviso: ' + e.message);
   }
 }
-
