@@ -583,16 +583,23 @@ function diagnosticoColumnas() {
 }
 
 /**
- * QUE HACE: recorre TODOS los ficheros de periodo y compara las columnas de cada
- *          pestana con el esquema habitual (el que tiene la mayoria). Devuelve
- *          la lista de ficheros que se desvian y en que columna exactamente.
+ * QUE HACE: recorre TODOS los ficheros de periodo y cuenta la historia de sus
+ *          columnas: cuando aparece cada una por primera vez y cuando deja de
+ *          aparecer. Ademas senala los ficheros que rompen el esquema de sus
+ *          vecinos, que es donde esta un cambio hecho sin querer.
  * PARA QUE: si el maestro tiene datos partidos entre dos columnas, esto dice
- *          QUE FICHEROS hay que corregir en el origen, no solo que hay un lio.
+ *          QUE FICHEROS hay que corregir en el origen y en que punto cambia el
+ *          esquema.
+ * CRITERIO: la referencia es el fichero MAS RECIENTE, no el mas repetido. Con
+ *          anos de ficheros, el mas repetido seria el esquema viejo y marcaria
+ *          como raros los ficheros modernos, que son los buenos. Y un cambio
+ *          solo se senala cuando el fichero se sale de lo que hacen sus DOS
+ *          vecinos: si los vecinos tambien cambiaron, era una evolucion normal.
  * COMO SE LEE:
- *          "esquema habitual (147 ficheros): cliente, importe, canal"
- *          "desviaciones: 3"
- *          "  - 2024/f - Y24W31: falta: canal | sobra: canal_venta"
- *          Ese fichero tiene la columna renombrada: se corrige en el origen.
+ *          "vida de cada columna: importe: Y24W01 -> Y26W02  <-- deja de aparecer"
+ *          "                      importe_total: Y26W03 -> Y26W48"
+ *          Ese corte entre Y26W02 y Y26W03 es el renombrado: mira el fichero
+ *          Y26W03 y los de alrededor.
  * TARDA: abre cada fichero, asi que con 150 ficheros puede irse a un par de
  *          minutos. Es de solo lectura: no escribe nada.
  * RESULTADO: Ver > Registro de ejecuciones.
@@ -630,21 +637,23 @@ function diagnosticoFicheros() {
         var sh = ss.getSheetByName(resolveSheetName_(ss, e.origen));
         var hr = e.headerRow || CONFIG.headerRow;
         if (sh.getLastRow() < hr || sh.getLastColumn() === 0) {
-          recogidas[e.destino].push({ ruta: rutaDe_(f), error: 'la pestana "' + e.origen + '" no tiene datos' });
+          recogidas[e.destino].push({ ruta: rutaDe_(f), periodo: f.periodo,
+            error: 'la pestana "' + e.origen + '" no tiene datos' });
           return;
         }
         var h = sh.getRange(hr, 1, 1, sh.getLastColumn()).getValues()[0]
           .map(function (v) { return String(v).trim(); })
           .filter(function (v) { return v !== ''; });
-        recogidas[e.destino].push({ ruta: rutaDe_(f), header: h });
+        recogidas[e.destino].push({ ruta: rutaDe_(f), periodo: f.periodo, header: h });
       } catch (err) {
-        recogidas[e.destino].push({ ruta: rutaDe_(f), error: err.message });
+        recogidas[e.destino].push({ ruta: rutaDe_(f), periodo: f.periodo, error: err.message });
       }
     });
   });
 
-  // 2. Por entidad: esquema mas frecuente y ficheros que se desvian de el.
-  var lines = ['Comparacion de las columnas de cada fichero con el esquema habitual.'];
+  // 2. Por entidad: referencia = fichero mas reciente, vida de cada columna y
+  //    ficheros que rompen el esquema de sus vecinos.
+  var lines = ['Comparacion de las columnas de cada fichero con el esquema de los mas recientes.'];
   lines.push('Ficheros de periodo encontrados: ' + files.length);
 
   CONFIG.entities.forEach(function (e) {
@@ -652,37 +661,55 @@ function diagnosticoFicheros() {
     lines.push('=== destino "' + e.destino + '"  <-  pestana "' + e.origen + '" ===');
 
     var lista = recogidas[e.destino];
-    var cuenta = {};
-    lista.forEach(function (x) {
-      if (!x.header) return;
-      var clave = x.header.join(' | ');
-      cuenta[clave] = (cuenta[clave] || 0) + 1;
-    });
+    var legibles = lista.filter(function (x) { return x.header; });
 
-    // El esquema habitual es el que mas se repite. Se compara con el, no con el
-    // maestro: si el maestro ya tiene una columna fantasma, compararlo con el
-    // marcaria como raros los 147 ficheros buenos.
-    var habitual = null;
-    var veces = 0;
-    Object.keys(cuenta).forEach(function (k) {
-      if (cuenta[k] > veces) { veces = cuenta[k]; habitual = k; }
-    });
-
-    if (!habitual) {
+    if (!legibles.length) {
       lines.push('  no se ha podido leer ninguna cabecera');
       return;
     }
 
-    var columnasHabituales = habitual === '' ? [] : habitual.split(' | ');
-    lines.push('  esquema habitual (' + veces + ' ficheros): ' + habitual);
+    // La referencia es el fichero MAS RECIENTE, no el mas repetido. Con anos de
+    // ficheros, la mayoria son antiguos y la moda seria el esquema viejo: marcaria
+    // como raros precisamente los ficheros modernos, que son los buenos.
+    var referencia = legibles[legibles.length - 1];
+    lines.push('  referencia: esquema del fichero mas reciente (' +
+      (referencia.periodo || referencia.ruta) + ')');
+    lines.push('    ' + referencia.header.join(' | '));
 
-    // Referencia: lo que tiene el maestro ahora mismo.
+    // Vida de cada columna: en que periodo aparece por primera vez y en cual por
+    // ultima. Esto es lo que cuenta la historia: una columna que termina en Y26W02
+    // y otra que empieza en Y26W03 es un renombrado en ese punto exacto.
+    var vida = {};
+    var ordenColumnas = [];
+    lista.forEach(function (x, i) {
+      if (!x.header) return;
+      x.header.forEach(function (c) {
+        if (!vida[c]) {
+          vida[c] = { desde: i, hasta: i };
+          ordenColumnas.push(c);
+        } else {
+          vida[c].hasta = i;
+        }
+      });
+    });
+
+    lines.push('  vida de cada columna (primera -> ultima aparicion, por periodo):');
+    ordenColumnas.forEach(function (c) {
+      var d = lista[vida[c].desde];
+      var h = lista[vida[c].hasta];
+      var nota = '';
+      if (vida[c].desde === vida[c].hasta) nota = '  <-- solo en un fichero';
+      else if (vida[c].hasta < lista.length - 1) nota = '  <-- deja de aparecer';
+      lines.push('    ' + c + ': ' + (d.periodo || d.ruta) + ' -> ' + (h.periodo || h.ruta) + nota);
+    });
+
+    // Comparacion con el maestro, solo como referencia de lo que hay que limpiar.
     var shMaster = master.getSheetByName(e.destino);
     if (shMaster) {
       var hMaster = readHeader_(shMaster);
       var hm = hMaster.slice(META_HEADERS.length, hMaster.length - 1);
       lines.push('  el maestro tiene: ' + (hm.join(' | ') || '(ninguna)'));
-      var sobranEnMaestro = hm.filter(function (c) { return columnasHabituales.indexOf(c) === -1; });
+      var sobranEnMaestro = hm.filter(function (c) { return referencia.header.indexOf(c) === -1; });
       if (sobranEnMaestro.length) {
         lines.push('  OJO: el maestro conserva columnas que el origen ya no trae: ' + sobranEnMaestro.join(', ') +
           '. Esas son las que hay que borrar del maestro.');
@@ -691,21 +718,36 @@ function diagnosticoFicheros() {
       lines.push('  el maestro todavia no tiene esa pestana');
     }
 
-    // Desviaciones: ficheros cuyo juego de columnas no es el habitual.
-    var desvios = lista.filter(function (x) {
-      if (x.error) return true;
-      return x.header.join(' | ') !== habitual;
+    // Anomalias: un fichero que no coincide con sus DOS vecinos, cuando esos dos
+    // vecinos si coinciden entre si. Eso es un cambio aislado (un renombrado
+    // hecho sin querer en ese fichero), no una evolucion del esquema. Una
+    // transicion de verdad la comparten todos los ficheros siguientes, asi que
+    // no se senala.
+    var firma = function (x) { return x && x.header ? x.header.join(' | ') : '(sin datos)'; };
+    var anomalos = [];
+
+    lista.forEach(function (x, i) {
+      if (x.error) { anomalos.push(x); return; }
+      if (i === 0 || i === lista.length - 1) return;
+
+      var previo = firma(lista[i - 1]);
+      var actual = firma(x);
+      var siguiente = firma(lista[i + 1]);
+
+      if (previo === siguiente && actual !== previo) {
+        anomalos.push({ ruta: x.ruta, periodo: x.periodo, header: x.header, vecinos: lista[i - 1].header });
+      }
     });
 
-    lines.push('  desviaciones: ' + desvios.length + ' de ' + lista.length);
-    desvios.sort(function (a, b) { return a.ruta < b.ruta ? -1 : 1; });
-    desvios.forEach(function (x) {
+    lines.push('  ficheros que rompen el esquema de sus vecinos: ' + anomalos.length);
+    anomalos.forEach(function (x) {
       if (x.error) {
         lines.push('  - ' + x.ruta + ': ' + x.error);
         return;
       }
-      var faltan = columnasHabituales.filter(function (c) { return x.header.indexOf(c) === -1; });
-      var sobran = x.header.filter(function (c) { return columnasHabituales.indexOf(c) === -1; });
+      var base = x.vecinos || referencia.header;
+      var faltan = base.filter(function (c) { return x.header.indexOf(c) === -1; });
+      var sobran = x.header.filter(function (c) { return base.indexOf(c) === -1; });
       var detalle = [];
       if (faltan.length) detalle.push('falta: ' + faltan.join(', '));
       if (sobran.length) detalle.push('sobra: ' + sobran.join(', '));
